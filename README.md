@@ -216,3 +216,13 @@ Measured on Snapdragon 8+ Gen 1 (ARM Cortex-X2 @ 3.2 GHz), Qwen2.5 0.5B Instruct
 ## License
 
 MIT — see [LICENSE](LICENSE). Use freely, modify, distribute.
+
+## Acknowledgements
+
+Calm was inspired by two pioneering projects:
+
+- **[Colibri](https://github.com/JustVugg/colibri)** — Zero-dependency pure-C runtime for running 744B MoE models on consumer hardware. Showed that a self-contained C binary for LLM inference is possible and practical.
+
+- **[Bonsai](https://prismml.com/news/bonsai-27b) by PrismML** — First 27B model fitting on iPhone via 1-bit binary quantization. Proved that extreme quantization (1.125 bits/weight) works on mobile devices. BQ1_0 and TQ1_0 formats in Calm implement similar binary/ternary packing schemes.
+
+No code was copied from either project. Calm is an independent implementation inspired by their ideas.
