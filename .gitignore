@@ -1,23 +1,22 @@
+
 # Binaries
+# Build artifacts
+# Editor/OS
+# GGUF models (too large for git)
+# Object files
+*.d
+*.gguf
+*.o
+*.su
+*.swo
+*.swp
+*~
+.DS_Store
+Thumbs.db
+calm
+calm_convert
 cortex
 cortex_convert
 test_quant
 test_tokenizer
 test_vec
-
-# Object files
-*.o
-
-# GGUF models (too large for git)
-*.gguf
-
-# Build artifacts
-*.su
-*.d
-
-# Editor/OS
-.DS_Store
-Thumbs.db
-*.swp
-*.swo
-*~
