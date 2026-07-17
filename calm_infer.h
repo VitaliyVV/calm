@@ -6,7 +6,7 @@
  *
  * Usage:
  *   ct_gguf_context* gguf = ct_gguf_open("model.gguf");
- *   ct_infer_state* s = ct_infer_create(gguf);
+ *   ct_infer_state* s = ct_infer_create(gguf, 0, 0);
  *   ct_infer_generate(s, tokens, n_prompt, 128, output, sizeof(output));
  *   ct_infer_free(s);
  *   ct_gguf_close(gguf);
@@ -83,6 +83,7 @@ typedef struct {
     float* scores;   /* [max_ctx]     — attention scores        */
     float* ffbuf;    /* [n_ff]        — SiLU(gate) * up / res   */
     float* logits;   /* [n_vocab]     — output logits           */
+    int gpu_layers;   /* layers offloaded to GPU (0 = CPU only, 99 = all) */
     void* vk_backend; /* ct_vulkan_backend*, optional GPU offload */
 } ct_infer_state;
 
@@ -96,8 +97,10 @@ void embed_row(float* out, const void* table, int type, int token, int n_embd);
 /* ─── API ─── */
 
 /* Load model weights from an already-opened GGUF context.
+ * max_ctx: override KV cache context length (0 = use GGUF default).
+ * gpu_layers: number of layers to offload to GPU (0 = CPU only, 99 = all).
  * Returns NULL on failure (unsupported arch, missing tensors). */
-ct_infer_state* ct_infer_create(ct_gguf_context* gguf);
+ct_infer_state* ct_infer_create(ct_gguf_context* gguf, int max_ctx, int gpu_layers);
 
 /* Run forward pass for position `pos` using hidden_in as the input state.
  * hidden_out receives the output (one transformer block).

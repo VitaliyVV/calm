@@ -51,6 +51,142 @@ static void vk_upload_weight(const void* w, int I, int O, const char* name) {
 #endif /* CT_VULKAN */
 
 /* ═══════════════════════════════════════════════════════════════
+ * K-quant block structures (GGUF v3 spec)
+ * ═══════════════════════════════════════════════════════════════ */
+
+#define CT_QK_K 256
+
+#pragma pack(push, 1)
+typedef struct {
+    uint16_t d;     /* FP16 scale */
+    uint8_t  qh[4]; /* 5th bit for 32 values */
+    uint8_t  qs[16];/* Low 4 bits for 32 values */
+} ct_block_q5_0;
+
+typedef struct {
+    uint16_t d;       /* FP16 super-block scale */
+    uint16_t dmin;    /* FP16 super-block min */
+    uint8_t  scales[8];  /* Sub-block 6-bit scales */
+    uint8_t  qs[128];    /* 4-bit quants for 256 values */
+} ct_block_q4_K;
+
+typedef struct {
+    uint16_t d;        /* FP16 super-block scale */
+    uint8_t  ql[128];  /* Lower 4 bits of quants */
+    uint8_t  qh[64];   /* Upper 2 bits of quants (packed) */
+    int8_t   scales[16]; /* 8-bit sub-block scales */
+} ct_block_q6_K;
+
+typedef struct {
+    uint16_t d;       /* FP16 super-block scale */
+    uint8_t  qs[128]; /* 8-bit quants for 128 values */
+} ct_block_q8_K;
+#pragma pack(pop)
+
+/* Dequantize one Q5_0 block of 32 values to float */
+static void deq_q5_0(const ct_block_q5_0* b, float* out) {
+    float d = ct_fp16_to_fp32(b->d);
+    for (int i = 0; i < 32; i++) {
+        int nib = (b->qs[i >> 1] >> ((i & 1) << 2)) & 0xF;
+        int hi  = (b->qh[i >> 3] >> (i & 7)) & 1;
+        out[i] = ((float)(nib | (hi << 4)) - 16.0f) * d;
+    }
+}
+
+/* Dequantize one Q4_K super-block of 256 values to float */
+static void deq_q4_K(const ct_block_q4_K* b, float* out) {
+    float d    = ct_fp16_to_fp32(b->d);
+    float dmin = ct_fp16_to_fp32(b->dmin);
+    for (int j = 0; j < 256; j++) {
+        int iscale = j / 32;
+        int sc = (b->scales[iscale / 2] >> ((iscale & 1) << 2)) & 0xF;
+        sc = (sc & 8) ? (sc | 0xF0) : sc; /* sign-extend 4-bit */
+        float s  = d * sc;
+        float sm = dmin * (sc - 0x10);
+        int nib  = (b->qs[j >> 1] >> ((j & 1) << 2)) & 0xF;
+        out[j] = (float)nib * s + sm;
+    }
+}
+
+/* Dequantize one Q6_K super-block of 256 values to float */
+static void deq_q6_K(const ct_block_q6_K* b, float* out) {
+    float d = ct_fp16_to_fp32(b->d);
+    for (int j = 0; j < 256; j++) {
+        int ql = (b->ql[j >> 1] >> ((j & 1) << 2)) & 0xF;
+        int qh = (b->qh[j >> 2] >> ((j & 3) << 1)) & 3;
+        int val = ql | (qh << 4);
+        if (val > 63) val -= 128; /* sign-extend 7-bit */
+        int sc_idx = j / 16;
+        out[j] = (float)val * (float)b->scales[sc_idx] * d;
+    }
+}
+
+/* Dequantize one Q8_K super-block of 128 values to float */
+static void deq_q8_K(const ct_block_q8_K* b, float* out) {
+    float d = ct_fp16_to_fp32(b->d);
+    for (int j = 0; j < 128; j++)
+        out[j] = (float)((int8_t)b->qs[j]) * d;
+}
+
+/* Scalar K-quant matmul — dequant block + dot product */
+
+static void matmul_q5_0(float* y, const float* x, const ct_block_q5_0* w, int I, int O) {
+    float buf[32];
+    for (int o = 0; o < O; o++) {
+        float sum = 0.0f;
+        int base = o * I;
+        for (int b = 0; b < I / 32; b++) {
+            deq_q5_0(&w[base / 32 + b], buf);
+            for (int i = 0; i < 32; i++)
+                sum += x[b * 32 + i] * buf[i];
+        }
+        y[o] = sum;
+    }
+}
+
+static void matmul_q4_K(float* y, const float* x, const ct_block_q4_K* w, int I, int O) {
+    float buf[256];
+    for (int o = 0; o < O; o++) {
+        float sum = 0.0f;
+        int base = o * I;
+        for (int b = 0; b < I / CT_QK_K; b++) {
+            deq_q4_K(&w[base / CT_QK_K + b], buf);
+            for (int i = 0; i < CT_QK_K; i++)
+                sum += x[b * CT_QK_K + i] * buf[i];
+        }
+        y[o] = sum;
+    }
+}
+
+static void matmul_q6_K(float* y, const float* x, const ct_block_q6_K* w, int I, int O) {
+    float buf[256];
+    for (int o = 0; o < O; o++) {
+        float sum = 0.0f;
+        int base = o * I;
+        for (int b = 0; b < I / CT_QK_K; b++) {
+            deq_q6_K(&w[base / CT_QK_K + b], buf);
+            for (int i = 0; i < CT_QK_K; i++)
+                sum += x[b * CT_QK_K + i] * buf[i];
+        }
+        y[o] = sum;
+    }
+}
+
+static void matmul_q8_K(float* y, const float* x, const ct_block_q8_K* w, int I, int O) {
+    float buf[128];
+    for (int o = 0; o < O; o++) {
+        float sum = 0.0f;
+        int base = o * I;
+        for (int b = 0; b < I / 128; b++) {
+            deq_q8_K(&w[base / 128 + b], buf);
+            for (int i = 0; i < 128; i++)
+                sum += x[b * 128 + i] * buf[i];
+        }
+        y[o] = sum;
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════
  * F16 matmul (scalar — dequantize on the fly)
  * ═══════════════════════════════════════════════════════════════ */
 
@@ -105,6 +241,18 @@ void matmul(float* y, const float* x, const void* w, int type, int I, int O) {
             break;
         case CT_GGUF_TYPE_TQ1_0:
             ct_matmul_tq1_0(y, x, (const ct_block_tq1_0*)w, I, O);
+            break;
+        case CT_GGUF_TYPE_Q5_0:
+            matmul_q5_0(y, x, (const ct_block_q5_0*)w, I, O);
+            break;
+        case CT_GGUF_TYPE_Q4_K:
+            matmul_q4_K(y, x, (const ct_block_q4_K*)w, I, O);
+            break;
+        case CT_GGUF_TYPE_Q6_K:
+            matmul_q6_K(y, x, (const ct_block_q6_K*)w, I, O);
+            break;
+        case CT_GGUF_TYPE_Q8_K:
+            matmul_q8_K(y, x, (const ct_block_q8_K*)w, I, O);
             break;
         default:
             fprintf(stderr, "infer: unsupported matmul type %d (I=%d O=%d)\n", type, I, O);
@@ -205,6 +353,34 @@ void embed_row(float* out, const void* table, int type,
                     out[b * 32 + i] = ((float)nib - 8.0f) * d;
                 }
             }
+            break;
+        }
+        case CT_GGUF_TYPE_Q5_0: {
+            const ct_block_q5_0* blocks = (const ct_block_q5_0*)row;
+            int nb = (n_embd + 31) / 32;
+            for (int b = 0; b < nb; b++)
+                deq_q5_0(&blocks[b], out + b * 32);
+            break;
+        }
+        case CT_GGUF_TYPE_Q4_K: {
+            const ct_block_q4_K* blocks = (const ct_block_q4_K*)row;
+            int nb = (n_embd + 255) / 256;
+            for (int b = 0; b < nb; b++)
+                deq_q4_K(&blocks[b], out + b * 256);
+            break;
+        }
+        case CT_GGUF_TYPE_Q6_K: {
+            const ct_block_q6_K* blocks = (const ct_block_q6_K*)row;
+            int nb = (n_embd + 255) / 256;
+            for (int b = 0; b < nb; b++)
+                deq_q6_K(&blocks[b], out + b * 256);
+            break;
+        }
+        case CT_GGUF_TYPE_Q8_K: {
+            const ct_block_q8_K* blocks = (const ct_block_q8_K*)row;
+            int nb = (n_embd + 127) / 128;
+            for (int b = 0; b < nb; b++)
+                deq_q8_K(&blocks[b], out + b * 128);
             break;
         }
         default:
@@ -497,7 +673,7 @@ static int build_weights(ct_gguf_context* gguf, ct_infer_weights* w) {
  * ct_infer_create
  * ═══════════════════════════════════════════════════════════════ */
 
-ct_infer_state* ct_infer_create(ct_gguf_context* gguf) {
+ct_infer_state* ct_infer_create(ct_gguf_context* gguf, int max_ctx, int gpu_layers) {
     if (!gguf) return NULL;
 
     /* Initialize FP16 lookup table for quantized operations */
@@ -506,6 +682,7 @@ ct_infer_state* ct_infer_create(ct_gguf_context* gguf) {
     ct_infer_state* s = (ct_infer_state*)calloc(1, sizeof(ct_infer_state));
     if (!s) return NULL;
     s->gguf = gguf;
+    s->gpu_layers = (gpu_layers < 0) ? 0 : gpu_layers;
 
     /* Extract config */
     if (extract_config(gguf, &s->w.config) != 0) {
@@ -554,8 +731,10 @@ ct_infer_state* ct_infer_create(ct_gguf_context* gguf) {
                 }
             }
         }
-        /* Per-layer Q8_0 weights */
-        for (int i = 0; i < cfg->n_layer; i++) {
+        /* Per-layer Q8_0 weights (only first gpu_layers) */
+        int vk_max_layer = (s->gpu_layers >= cfg->n_layer || s->gpu_layers >= 99)
+                           ? cfg->n_layer : s->gpu_layers;
+        for (int i = 0; i < vk_max_layer; i++) {
             ct_infer_layer* lw = &s->w.layers[i];
             char name[128];
             /* Check each weight in the layer */
@@ -631,7 +810,9 @@ ct_infer_state* ct_infer_create(ct_gguf_context* gguf) {
         }
     }
 
-    /* KV cache: cap context to reasonable size */
+    /* KV cache: override context with plan value, cap to reasonable size */
+    if (max_ctx > 0 && max_ctx < cfg->n_ctx_max)
+        cfg->n_ctx_max = max_ctx;
     if (cfg->n_ctx_max > 4096) cfg->n_ctx_max = 4096;
     s->max_ctx = cfg->n_ctx_max;
     int nhkv = cfg->n_head_kv;
@@ -698,9 +879,11 @@ int ct_infer_forward(ct_infer_state* s, int pos,
         /* RMS norm (s->normed is dedicated — no aliasing with bufs) */
         rms_norm(s->normed, h, lw->attn_norm, E, cfg->norm_rms_eps);
 
-        /* Batch: Q, K, V all from the same normed input */
+        /* Batch: Q, K, V all from the same normed input (skip Vulkan for layers beyond gpu_layers) */
+        int use_vk = 0;
 #ifdef CT_VULKAN
-        if (g_vk) ct_vulkan_batch_begin(g_vk);
+        use_vk = (g_vk && layer < s->gpu_layers);
+        if (use_vk) ct_vulkan_batch_begin(g_vk);
 #endif
         __asm__ volatile("" ::: "memory");
         matmul(s->buf_q, s->normed, lw->attn_q, lw->t_q, E, H * HD);
@@ -709,7 +892,7 @@ int ct_infer_forward(ct_infer_state* s, int pos,
         __asm__ volatile("" ::: "memory");
         matmul(s->buf_v, s->normed, lw->attn_v, lw->t_v, E, HK * HD);
 #ifdef CT_VULKAN
-        if (g_vk) ct_vulkan_batch_end(g_vk);
+        if (use_vk) ct_vulkan_batch_end(g_vk);
 #endif
         /* Add QKV biases if present (Qwen2 uses them, LLaMA doesn't) */
         if (lw->attn_q_bias)
@@ -864,12 +1047,12 @@ int ct_infer_forward(ct_infer_state* s, int pos,
 
             /* Batch: gate + up (both read normed, write different buffers) */
 #ifdef CT_VULKAN
-            if (g_vk) ct_vulkan_batch_begin(g_vk);
+            if (use_vk) ct_vulkan_batch_begin(g_vk);
 #endif
             matmul(s->ffbuf, s->normed, lw->ffn_gate, lw->t_g, E, cfg->n_ff);
             matmul(s->buf_k, s->normed, lw->ffn_up, lw->t_u, E, cfg->n_ff);
 #ifdef CT_VULKAN
-            if (g_vk) ct_vulkan_batch_end(g_vk);
+            if (use_vk) ct_vulkan_batch_end(g_vk);
 #endif
 
             /* SiLU gate output in-place */
@@ -882,11 +1065,11 @@ int ct_infer_forward(ct_infer_state* s, int pos,
 
             /* Down: buf_v[E] = (gate*up) @ Wdown */
 #ifdef CT_VULKAN
-            if (g_vk) ct_vulkan_batch_begin(g_vk);
+            if (use_vk) ct_vulkan_batch_begin(g_vk);
 #endif
             matmul(s->buf_v, s->ffbuf, lw->ffn_down, lw->t_d, cfg->n_ff, E);
 #ifdef CT_VULKAN
-            if (g_vk) ct_vulkan_batch_end(g_vk);
+            if (use_vk) ct_vulkan_batch_end(g_vk);
 #endif
             for (int i = 0; i < E; i++)
                 h[i] += s->buf_v[i];

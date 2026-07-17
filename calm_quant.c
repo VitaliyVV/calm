@@ -539,10 +539,14 @@ void ct_matmul_tq1_0(float* y, const float* x,
         const ct_block_tq1_0* tq_row = W + (int64_t)j * nb_per_row_tq;
         int q8_count = 0;
 
-        /* Dequant all TQ1_0 blocks in this row → Q8_0 blocks */
+        /* Dequant all TQ1_0 blocks in this row → Q8_0 blocks.
+         * Each TQ1_0 block covers at most 256 columns. Cap cols_in_block to 256
+         * so q8_count tracks the actual number of Q8_0 blocks written.
+         * (dequant_tq1_0_to_q8_0 also clamps internally, but q8_count must match.) */
         for (int b = 0; b < nb_per_row_tq; b++) {
-            int cols_in_block = I - b * 256;
-            if (cols_in_block <= 0) break;
+            int remaining = I - b * 256;
+            if (remaining <= 0) break;
+            int cols_in_block = remaining < 256 ? remaining : 256;
             dequant_tq1_0_to_q8_0(&tq_row[b], &q8_buf[q8_count], cols_in_block);
             q8_count += (cols_in_block + 31) / 32;
         }
