@@ -958,8 +958,16 @@ CalmError calm_plan_create(const CalmDevice* device,
         plan->target_quant = CALM_QUANT_TQ1_0; // ternary 1.58-bit
     }
 
-    // Backend — auto-detect
-    plan->backend = CALM_BACKEND_AUTO;
+    // Backend — resolve AUTO to actual backend
+    if (device->has_vulkan) {
+        plan->backend = CALM_BACKEND_VULKAN;
+    } else if (device->has_metal) {
+        plan->backend = CALM_BACKEND_METAL;
+    } else if (device->has_cuda) {
+        plan->backend = CALM_BACKEND_CUDA;
+    } else {
+        plan->backend = CALM_BACKEND_CPU;
+    }
 
     return CALM_OK;
 }
@@ -1238,7 +1246,9 @@ CalmModel* calm_model_load(CalmRuntime* rt,
     // Try to open GGUF for native inference
     model->gguf = ct_gguf_open(path);
     if (model->gguf) {
-        model->infer = ct_infer_create(model->gguf);
+        model->infer = ct_infer_create(model->gguf,
+                                        (int)model->plan.context_length,
+                                        (int)model->plan.gpu_layers);
         if (!model->infer) {
             // Not all architectures are supported — fall back to external backends
             ct_gguf_close(model->gguf);
@@ -2493,6 +2503,8 @@ static void print_usage(const char* prog) {
     printf("  %s analyze <model.gguf>    Analyze model\n", prog);
     printf("  %s run <model.gguf>        Smart launch\n", prog);
     printf("       [prompt]               Prompt text (default: \"The capital of France is\")\n");
+    printf("       --backend cpu|vulkan   Force backend (default: auto-detect)\n");
+    printf("       --gpu-layers N         Layers to offload to GPU (default: 99 = all)\n");
     printf("       --tools <file.json>    Tool definitions (function calling)\n");
     printf("       --temp F               Temperature (default: 0.0)\n");
     printf("       --top-p F              Top-p sampling (default: 0.95)\n");
@@ -2831,6 +2843,26 @@ int main(int argc, char** argv) {
 
     // ── run ──
     if (strcmp(argv[1], "run") == 0) {
+        // Parse --backend and --gpu-layers BEFORE model load
+        for (int i = 3; i < argc; i++) {
+            if (strcmp(argv[i], "--backend") == 0 && i + 1 < argc) {
+                const char* be = argv[++i];
+                if (strcmp(be, "cpu") == 0) {
+                    plan.backend = CALM_BACKEND_CPU;
+                    plan.gpu_layers = 0;
+                } else if (strcmp(be, "vulkan") == 0) {
+                    plan.backend = CALM_BACKEND_VULKAN;
+                    plan.gpu_layers = 99;
+                } else {
+                    fprintf(stderr, "Unknown backend '%s', using auto-detected\n", be);
+                }
+            } else if (strcmp(argv[i], "--gpu-layers") == 0 && i + 1 < argc) {
+                int gl = atoi(argv[++i]);
+                if (gl < 0) gl = 0;
+                plan.gpu_layers = gl;
+            }
+        }
+
         print_model_info(&info, &plan);
 
         printf("%sLaunching...%s\n\n", C(ANSI_BOLD), C(ANSI_RESET));
@@ -2857,7 +2889,11 @@ int main(int argc, char** argv) {
         float repeat_penalty = 1.1f;
         int max_tokens = 20;
         for (int i = 3; i < argc; i++) {
-            if (strcmp(argv[i], "--tools") == 0 && i + 1 < argc) {
+            if (strcmp(argv[i], "--backend") == 0 && i + 1 < argc) {
+                i++; /* already handled in pre-parse */
+            } else if (strcmp(argv[i], "--gpu-layers") == 0 && i + 1 < argc) {
+                i++; /* already handled in pre-parse */
+            } else if (strcmp(argv[i], "--tools") == 0 && i + 1 < argc) {
                 tools_path = argv[++i];
             } else if (strcmp(argv[i], "--temp") == 0 && i + 1 < argc) {
                 temp = (float)atof(argv[++i]);
