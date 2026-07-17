@@ -338,11 +338,49 @@ static bool write_gguf(const char* path,
                 break;
             }
             case CT_GGUF_VALUE_ARRAY: {
-                /* Write empty array (no array values preserved) */
-                uint32_t arr_type = 0;
-                uint64_t arr_len = 0;
-                fwrite(&arr_type, 4, 1, f);
-                fwrite(&arr_len, 8, 1, f);
+                /* Check if this is a vocabulary array — serialize from vocab struct */
+                const char* k = src->metadata.keys[i];
+                bool wrote = false;
+
+                if (k && strcmp(k, "tokenizer.ggml.tokens") == 0 && src->vocab.n_vocab > 0) {
+                    uint32_t arr_type = 8; /* string */
+                    uint64_t arr_len = (uint64_t)src->vocab.n_vocab;
+                    fwrite(&arr_type, 4, 1, f);
+                    fwrite(&arr_len, 8, 1, f);
+                    for (int vi = 0; vi < src->vocab.n_vocab; vi++) {
+                        size_t sl = src->vocab.tokens[vi] ? strlen(src->vocab.tokens[vi]) : 0;
+                        uint64_t sl64 = (uint64_t)sl;
+                        fwrite(&sl64, 8, 1, f);
+                        if (sl > 0) fwrite(src->vocab.tokens[vi], 1, sl, f);
+                    }
+                    wrote = true;
+                }
+                if (k && strcmp(k, "tokenizer.ggml.scores") == 0 && src->vocab.n_vocab > 0) {
+                    uint32_t arr_type = 6; /* float32 */
+                    uint64_t arr_len = (uint64_t)src->vocab.n_vocab;
+                    fwrite(&arr_type, 4, 1, f);
+                    fwrite(&arr_len, 8, 1, f);
+                    for (int vi = 0; vi < src->vocab.n_vocab; vi++)
+                        fwrite(&src->vocab.scores[vi], 4, 1, f);
+                    wrote = true;
+                }
+                if (k && strcmp(k, "tokenizer.ggml.token_type") == 0 && src->vocab.n_vocab > 0) {
+                    uint32_t arr_type = 5; /* int32 */
+                    uint64_t arr_len = (uint64_t)src->vocab.n_vocab;
+                    fwrite(&arr_type, 4, 1, f);
+                    fwrite(&arr_len, 8, 1, f);
+                    for (int vi = 0; vi < src->vocab.n_vocab; vi++)
+                        fwrite(&src->vocab.token_types[vi], 4, 1, f);
+                    wrote = true;
+                }
+
+                if (!wrote) {
+                    /* Fallback: write empty array */
+                    uint32_t arr_type = 0;
+                    uint64_t arr_len = 0;
+                    fwrite(&arr_type, 4, 1, f);
+                    fwrite(&arr_len, 8, 1, f);
+                }
                 break;
             }
             case CT_GGUF_VALUE_UINT64: {
@@ -379,11 +417,13 @@ static bool write_gguf(const char* path,
         uint32_t n_dims = t->n_dims;
         int out_type = tensor_types ? tensor_types[i] : (int)t->type;
 
+        /* GGUF v3 order: n_dims → dims → type → offset (NOT n_dims → type → dims!) */
         fwrite(&n_dims, 4, 1, f);
-        fwrite(&out_type, 4, 1, f);
 
         for (uint32_t d = 0; d < n_dims; d++)
             fwrite(&t->dims[d], 8, 1, f);
+
+        fwrite(&out_type, 4, 1, f);
 
         /* Write offset (will be recalculated) */
         fwrite(&current_offset, 8, 1, f);

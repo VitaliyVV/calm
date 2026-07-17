@@ -1,0 +1,119 @@
+#version 460
+
+// ─── Q8_0 Matmul Compute Shader ───
+//
+// y[O] = x[I] @ W[O][I]
+// W is stored in Q8_0 format: blocks of 32 values with FP16 scale.
+// Each block packed as 9 × uint32 in the weight SSBO:
+//   word 0: low16 = FP16 scale d (raw bits)
+//   words 1-8: qs[32] as 8 × uint32, each = 4 × int8
+//
+// Dispatch: ceil(O / 256) workgroups × 256 invocations × 1
+// Each invocation processes one output row.
+//
+// NOTE: Avoids uint16_t and bitfieldExtract because Adreno driver
+// has bugs with these on some mobile implementations.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    int I;              // input dimension
+    int O;              // output dimension
+    int blk_per_I;      // ceil(I / 32) = blocks per output row
+    int blk_stride;     // stride in uint32 words between rows (blk_per_I * 9, aligned)
+};
+
+// Device-local weight buffer (repacked Q8_0 blocks as uint32)
+layout(binding = 0, std430) readonly buffer Weights {
+    uint w[];
+};
+
+// Host-coherent input vector x[I]
+layout(binding = 1, std430) readonly buffer Input {
+    float x[];
+};
+
+// Host-coherent output vector y[O]
+layout(binding = 2, std430) buffer Output {
+    float y[];
+};
+
+// ─── FP16 → FP32 (avoids uint16_t, uses uint throughout) ───
+float fp16_to_fp32_u(uint h_bits) {
+    uint sign   = (h_bits & 0x8000U) << 16;
+    uint exp16  = (h_bits >> 10) & 0x1FU;
+    uint mant   = h_bits & 0x03FFU;
+    uint r;
+    if (exp16 == 0) {
+        if (mant == 0) {
+            r = sign;                           // ±0
+        } else {
+            // Subnormal: normalize
+            int s = 10;
+            uint m = mant;
+            while ((m & 0x0400) == 0) { m <<= 1; s--; }
+            m &= 0x03FF;
+            uint exp32 = uint(127 - 14 - s);
+            r = sign | (exp32 << 23) | (m << 13);
+        }
+    } else if (exp16 == 31) {
+        r = sign | 0x7F800000U | (mant << 13);  // inf/nan
+    } else {
+        uint exp32 = exp16 + 127 - 15;
+        r = sign | (exp32 << 23) | (mant << 13);
+    }
+    return uintBitsToFloat(r);
+}
+
+// ─── Unpack int8 from uint32 (avoids bitfieldExtract) ───
+int unpack_int8_man(uint w, int byte_idx) {
+    // Extract byte at position byte_idx (0-3), sign-extend
+    uint raw = (w >> uint(byte_idx * 8)) & 0xFFU;
+    // Sign extend: if bit 7 is set, subtract 256
+    // raw >= 128 is equivalent to (raw & 0x80) != 0
+    return int(raw) - int((raw >> 7) * 256);
+}
+
+// ─── Main ───
+void main() {
+    uint row = gl_GlobalInvocationID.x;
+    if (row >= uint(O)) return;
+
+    // Base pointer to this row's blocks in the weight buffer
+    uint base_word = row * uint(blk_stride);
+
+    float sum = 0.0;
+
+    for (int b = 0; b < blk_per_I; b++) {
+        uint word_base = base_word + uint(b) * 9;
+
+        // Unpack FP16 scale from low 16 bits (avoid uint16_t)
+        uint d_bits = w[word_base] & 0xFFFFU;
+        float d = fp16_to_fp32_u(d_bits);
+
+        // Process 32 elements in this block
+        int el_base = b * 32;
+
+        // Unroll 8 groups of 4
+        for (int g = 0; g < 8; g++) {
+            uint packed = w[word_base + 1 + uint(g)];
+            int i0 = el_base + g * 4;
+            int rem = I - i0;
+            if (rem <= 0) break;
+
+            float x0 = (i0 + 0 < I) ? x[i0 + 0] : 0.0;
+            float x1 = (i0 + 1 < I) ? x[i0 + 1] : 0.0;
+            float x2 = (i0 + 2 < I) ? x[i0 + 2] : 0.0;
+            float x3 = (i0 + 3 < I) ? x[i0 + 3] : 0.0;
+
+            float w0 = float(unpack_int8_man(packed, 0));
+            float w1 = float(unpack_int8_man(packed, 1));
+            float w2 = float(unpack_int8_man(packed, 2));
+            float w3 = float(unpack_int8_man(packed, 3));
+
+            sum += d * (x0 * w0 + x1 * w1 + x2 * w2 + x3 * w3);
+        }
+    }
+
+    y[row] = sum;
+}

@@ -1,8 +1,8 @@
 # Calm — Локальный LLM-рантайм без единой зависимости
 
-**Чистый C, никаких зависимостей, работает везде.** GGUF → токенизация → инференс → вызов инструментов → HTTP API.
+**Чистый C, никаких зависимостей, работает везде.** GGUF → токенизация → инференс → вызов инструментов → HTTP API. **Опциональный Vulkan GPU бэкенд** для ускорения Q8_0 матричных умножений на мобильных GPU.
 
-Собран для ARM (телефон, планшет, Raspberry Pi) и x86. Бинарник ~111 КБ. Генерирует ~5–10 токенов/с для Qwen2.5 0.5B на Snapdragon 8+ Gen 1.
+Собран для ARM (телефон, планшет, Raspberry Pi) и x86. Бинарник ~111 КБ. Генерирует ~5–10 токенов/с для Qwen2.5 0.5B на Snapdragon 8+ Gen 1 (CPU) или **~8–15 токенов/с с Vulkan GPU**.
 
 `llm` `gguf` `inference` `transformer` `qwen` `llama` `c` `no-dependencies` `zero-dependency` `bpe` `tokenizer` `quantization` `binary-quantization` `ternary` `neon` `arm` `android` `termux` `http-api` `openai-compatible` `function-calling` `tool-use` `local-ai` `on-device` `edge-computing` `mit-license`
 

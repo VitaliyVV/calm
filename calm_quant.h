@@ -148,6 +148,28 @@ void ct_quant_q4_0(const float* x, ct_block_q4_0* block, int count);
 void ct_quant_bq1_0(const float* x, ct_block_bq1_0* block, int count);
 void ct_quant_tq1_0(const float* x, ct_block_tq1_0* block, int count);
 
+/* Fast path: original mean(|w|) quantize without PTQ calibration */
+void ct_quant_tq1_0_fast(const float* x, ct_block_tq1_0* block, int count);
+
+/* ═══════════════════════════════════════════════════════════════
+ * PTQ Calibration (weight-only MSE-optimal scale/threshold)
+ * ═══════════════════════════════════════════════════════════════ */
+
+/* Calibrate binary quantization scale: finds α minimizing MSE
+ *   BQ1_0: quant(w) = α·sign(w)
+ *   Optimal α = mean(|w|) ← already what ct_quant_bq1_0 uses.
+ * Returns the MSE-optimal scale (for verification).
+ */
+float ct_calibrate_binary(const float* x, int n, float* out_mse);
+
+/* Calibrate ternary quantization: finds α minimizing MSE
+ *   TQ1_0: quant(w) = 0 if |w| < α/2, else α·sign(w)
+ *   Solves by sorting |w| and sweeping split points.
+ * Returns the MSE-optimal scale.
+ * If out_mse is non-NULL, stores the corresponding MSE.
+ */
+float ct_calibrate_ternary(const float* x, int n, float* out_mse);
+
 /* ═══════════════════════════════════════════════════════════════
  * Matmul: y[O] = x[I] @ W^T where W is quantized [O × I]
  *

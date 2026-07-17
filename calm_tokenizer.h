@@ -79,6 +79,11 @@ int ct_tokenizer_encode(ct_tokenizer* tok, const char* text,
 int ct_tokenizer_decode(ct_tokenizer* tok, const int* tokens, int n_tokens,
                         char* text, size_t text_size);
 
+/* Decode a single token ID to text (with GPT-2 byte decoding).
+ * Returns number of bytes written to text, or <0 on error. */
+int ct_tokenizer_decode_single(ct_tokenizer* tok, int token,
+                                char* text, size_t text_size);
+
 /* Free tokenizer. */
 void ct_tokenizer_free(ct_tokenizer* tok);
 

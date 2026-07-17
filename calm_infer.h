@@ -32,6 +32,8 @@ typedef struct {
     int   n_ctx_max;
     int   n_vocab;
     int   head_dim;
+    int   n_expert;           /* number of experts (0 = dense model) */
+    int   n_expert_per_token; /* top-k experts per token (e.g. 2)   */
     float norm_rms_eps;
     float rope_freq_base;
 } ct_infer_config;
@@ -47,9 +49,13 @@ typedef struct {
     float* attn_v_bias;        /* V bias (F32), may be NULL */
     void*  attn_out;  int t_o;
     float* ffn_norm;
-    void*  ffn_gate;  int t_g;
+    void*  ffn_gate;  int t_g;  /* dense: SwiGLU gate; MoE: router weights */
     void*  ffn_up;    int t_u;
     void*  ffn_down;  int t_d;
+    /* MoE expert FFN weights (NULL when model is dense) */
+    void** expert_gate;  int* t_eg;  /* [n_expert] */
+    void** expert_up;    int* t_eu;  /* [n_expert] */
+    void** expert_down;  int* t_ed;  /* [n_expert] */
 } ct_infer_layer;
 
 /* ─── Full model weights ─── */
@@ -77,6 +83,7 @@ typedef struct {
     float* scores;   /* [max_ctx]     — attention scores        */
     float* ffbuf;    /* [n_ff]        — SiLU(gate) * up / res   */
     float* logits;   /* [n_vocab]     — output logits           */
+    void* vk_backend; /* ct_vulkan_backend*, optional GPU offload */
 } ct_infer_state;
 
 /* ─── Internal functions exposed for diagnostics ─── */
@@ -98,18 +105,25 @@ ct_infer_state* ct_infer_create(ct_gguf_context* gguf);
 int ct_infer_forward(ct_infer_state* s, int pos,
                      const float* hidden_in, float* hidden_out);
 
-/* Sample next token ID from logits using temperature + argmax.
+/* Sample next token ID from logits.
+ * top_k = 0 means no top-k filtering.
+ * top_p = 1.0 means no nucleus filtering.
  * Returns token ID (0 = failure). */
-int ct_infer_sample(const float* logits, int n_vocab, float temp);
+int ct_infer_sample(const float* logits, int n_vocab, float temp, int top_k, float top_p);
 
-/* Generate tokens autoregressively.
+/* Generate tokens autoregressively with optional per-token streaming callback.
  * tokens[0..n_prompt-1] are input token IDs.
  * Appends generated token IDs to output_tokens (up to max_gen).
+ * If on_token is not NULL, called with each generated token ID (for SSE/streaming).
+ * top_p = 1.0 = disabled. repeat_penalty = 1.0 = disabled. top_k = 0 = disabled.
  * Returns number of tokens generated, or <0 on error. */
 int ct_infer_generate(ct_infer_state* s,
                       const int* tokens, int n_prompt,
                       int max_gen, float temp, int eos_id,
-                      int* output_tokens);
+                      int* output_tokens,
+                      void (*on_token)(int token, void* ctx),
+                      void* stream_ctx,
+                      float top_p, float repeat_penalty, int top_k);
 
 /* Free all inference buffers. */
 void ct_infer_free(ct_infer_state* s);

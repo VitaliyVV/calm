@@ -23,7 +23,6 @@ static bool ct_fp16_table_init = false;
 static void ct_fp16_init(void) {
     if (ct_fp16_table_init) return;
     /* Verify the table isn't uninitialized by checking a known value first */
-    fprintf(stderr, "[fp16] init: building table (first call)...\n");
     for (int i = 0; i < (1 << 16); i++) {
         uint16_t h = (uint16_t)i;
         /* Correct FP16 → FP32 bit conversion */
@@ -61,6 +60,127 @@ static inline float fp16_to_f32(uint16_t h) {
                 v, ct_fp16_table_init);
     }
     return v;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * PTQ Calibration: MSE-optimal scale/threshold for 1-bit formats
+ * ═══════════════════════════════════════════════════════════════ */
+
+/* Comparator for float sort (ascending) */
+static int cmp_float_asc(const void* a, const void* b) {
+    float fa = *(const float*)a;
+    float fb = *(const float*)b;
+    if (fa < fb) return -1;
+    if (fa > fb) return  1;
+    return 0;
+}
+
+float ct_calibrate_binary(const float* x, int n, float* out_mse) {
+    /* BQ1_0: quant(w) = α·sign(w)
+     * MSE = Σ(|wᵢ| - α)²
+     * dMSE/dα = 2·Σ(α - |wᵢ|) = 2(n·α - Σ|wᵢ|) = 0 → α = mean(|w|)
+     * So mean(|w|) is already MSE-optimal.
+     */
+    if (n <= 0) { if (out_mse) *out_mse = 0.0f; return 1.0f; }
+    float sum_abs = 0.0f;
+    for (int i = 0; i < n; i++) sum_abs += fabsf(x[i]);
+    float alpha = sum_abs / (float)n;
+    if (alpha < 1e-10f) alpha = 1.0f;
+    if (out_mse) {
+        float mse = 0.0f;
+        for (int i = 0; i < n; i++) {
+            float err = fabsf(x[i]) - alpha;
+            mse += err * err;
+        }
+        *out_mse = mse / (float)n;
+    }
+    return alpha;
+}
+
+float ct_calibrate_ternary(const float* x, int n, float* out_mse) {
+    /* TQ1_0: quant(w, α) = 0 if |w| < α/2, else α·sign(w)
+     *
+     * Find α that minimizes MSE by sweeping split points:
+     * 1. Sort |w| ascending
+     * 2. For split k (first k weights → 0, remaining n-k → ±α):
+     *    α = mean(|w|_remaining)
+     *    must satisfy: |w_k| < α/2 ≤ |w_{k+1}|  (consistency)
+     * 3. Pick split with lowest MSE
+     *
+     * Uses stack allocation for n ≤ CT_TQ1_0_BLOCK_SIZE (256),
+     * falls back to heap for larger arrays.
+     */
+    if (n <= 0) { if (out_mse) *out_mse = 0.0f; return 1.0f; }
+
+    /* Allocate sorted abs values — stack for small n, heap for large */
+    float abs_vals_stack[CT_TQ1_0_BLOCK_SIZE];
+    double prefix_stack[CT_TQ1_0_BLOCK_SIZE + 1];
+    float* abs_vals = (n <= CT_TQ1_0_BLOCK_SIZE) ? abs_vals_stack
+                     : (float*)malloc((size_t)n * sizeof(float));
+    double* prefix = (n <= CT_TQ1_0_BLOCK_SIZE) ? prefix_stack
+                    : (double*)malloc((size_t)(n + 1) * sizeof(double));
+
+    if ((size_t)n > CT_TQ1_0_BLOCK_SIZE && (!abs_vals || !prefix)) {
+        free(abs_vals); free(prefix);
+        float sum = 0.0f;
+        for (int i = 0; i < n; i++) sum += fabsf(x[i]);
+        float d = sum / (float)n;
+        if (d < 1e-10f) d = 1.0f;
+        if (out_mse) *out_mse = 0.0f;
+        return d;
+    }
+
+    for (int i = 0; i < n; i++) abs_vals[i] = fabsf(x[i]);
+    qsort(abs_vals, (size_t)n, sizeof(float), cmp_float_asc);
+
+    prefix[0] = 0.0;
+    for (int i = 0; i < n; i++) prefix[i + 1] = prefix[i] + (double)abs_vals[i];
+
+    float best_alpha = abs_vals[n - 1];
+    float best_mse = 1e30f;
+
+    for (int k = 0; k <= n - 2; k++) {
+        int nz = n - k;
+        double sum_nz = prefix[n] - prefix[k];
+        float alpha = (float)(sum_nz / (double)nz);
+        if (alpha < 1e-10f) continue;
+        float half_alpha = alpha * 0.5f;
+
+        if (k > 0 && abs_vals[k - 1] >= half_alpha) continue;
+        if (abs_vals[k] < half_alpha) continue;
+
+        double mse = 0.0;
+        for (int i = 0; i < k; i++)
+            mse += (double)abs_vals[i] * (double)abs_vals[i];
+        for (int i = k; i < n; i++) {
+            double err = (double)abs_vals[i] - (double)alpha;
+            mse += err * err;
+        }
+        float mse_f = (float)(mse / (double)n);
+        if (mse_f < best_mse) { best_mse = mse_f; best_alpha = alpha; }
+    }
+
+    /* Fallback if no consistent split found */
+    if (best_mse > 1e29f) {
+        double sum_all = prefix[n];
+        best_alpha = (float)(sum_all / (double)n);
+        if (best_alpha < 1e-10f) best_alpha = 1.0f;
+        if (out_mse) {
+            double mse = 0.0;
+            for (int i = 0; i < n; i++) {
+                double err = (double)abs_vals[i] - (double)best_alpha;
+                mse += err * err;
+            }
+            best_mse = (float)(mse / (double)n);
+        }
+    }
+
+    if ((size_t)n > CT_TQ1_0_BLOCK_SIZE) {
+        free(abs_vals);
+        free(prefix);
+    }
+    if (out_mse) *out_mse = best_mse;
+    return best_alpha;
 }
 
 #if defined(__ARM_NEON)
@@ -210,13 +330,14 @@ void ct_quant_bq1_0(const float* x, ct_block_bq1_0* block, int count) {
     }
 }
 
-/* TQ1_0 quantize: 5 ternary values per byte (base-3) */
+/* TQ1_0 quantize: 5 ternary values per byte (base-3)
+ * Uses MSE-optimal calibrated scale per block via ct_calibrate_ternary.
+ */
 void ct_quant_tq1_0(const float* x, ct_block_tq1_0* block, int count) {
     int n = count < 256 ? count : 256;
-    float sum_abs = 0.0f;
-    for (int i = 0; i < n; i++)
-        sum_abs += fabsf(x[i]);
-    float d = sum_abs / (float)n;
+
+    /* Compute MSE-optimal scale via calibration */
+    float d = ct_calibrate_ternary(x, n, NULL);
     if (d < 1e-10f) d = 1.0f;
     float id = 1.0f / d;
 
@@ -257,6 +378,105 @@ void ct_quant_tq1_0(const float* x, ct_block_tq1_0* block, int count) {
     }
 }
 
+/* TQ1_0 fast quantize: original mean(|w|) without PTQ calibration */
+void ct_quant_tq1_0_fast(const float* x, ct_block_tq1_0* block, int count) {
+    int n = count < 256 ? count : 256;
+    float sum_abs = 0.0f;
+    for (int i = 0; i < n; i++)
+        sum_abs += fabsf(x[i]);
+    float d = sum_abs / (float)n;
+    if (d < 1e-10f) d = 1.0f;
+    float id = 1.0f / d;
+
+    memset(block->qs, 0, sizeof(block->qs));
+    memset(block->qh, 0, sizeof(block->qh));
+    block->d = ct_fp32_to_fp16(d);
+
+    int idx = 0;
+    for (int i = 0; i < 48 && idx < n; i++) {
+        int byte_val = 0;
+        int mult = 1;
+        for (int j = 0; j < 5 && idx < n; j++) {
+            float v = x[idx] * id;
+            int t;
+            if (v > 0.5f) t = 2;
+            else if (v < -0.5f) t = 0;
+            else t = 1;
+            byte_val += t * mult;
+            mult *= 3;
+            idx++;
+        }
+        block->qs[i] = (uint8_t)byte_val;
+    }
+    for (int i = 0; i < 4 && idx < n; i++) {
+        uint8_t byte_val = 0;
+        for (int j = 0; j < 4 && idx < n; j++) {
+            float v = x[idx] * id;
+            int t;
+            if (v > 0.5f) t = 2;
+            else if (v < -0.5f) t = 0;
+            else t = 1;
+            byte_val |= (uint8_t)t << (j * 2);
+            idx++;
+        }
+        block->qh[i] = byte_val;
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * TQ1_0 → Q8_0 dequant for NEON matmul reuse
+ *
+ * TQ1_0 block (256 elements): base-3 packed {−1,0,+1} × d
+ * Q8_0 block (32 elements):   int8 × d
+ *
+ * Ternary values fit directly into int8, so we decode TQ1_0 →
+ * int8 packs and set Q8_0 scale = TQ1_0 scale. No float needed.
+ * ═══════════════════════════════════════════════════════════════ */
+
+/* Decode TQ1_0 block into 8 × Q8_0 blocks (256 elements → 8×32).
+ * out_q8 must point to at least 8 × CT_SIZEOF_Q8_0 bytes.
+ * Returns the number of valid elements (256 or less for partial block).
+ */
+static int dequant_tq1_0_to_q8_0(const ct_block_tq1_0* tq,
+                                   ct_block_q8_0* out_q8, int cols) {
+    int n = cols < 256 ? cols : 256;
+    int idx = 0;
+
+    /* Decode all 256 ternary values into a temporary int8 array */
+    int8_t tmp[256];
+    memset(tmp, 0, sizeof(tmp));
+
+    /* First 240 values from qs (48 bytes × 5 per byte, base-3) */
+    for (int i = 0; i < 48 && idx < 256; i++) {
+        int byte_val = tq->qs[i];
+        for (int j = 0; j < 5 && idx < 256; j++) {
+            int t = (byte_val % 3) - 1;  /* 0→-1, 1→0, 2→+1 */
+            byte_val /= 3;
+            tmp[idx++] = (int8_t)t;
+        }
+    }
+    /* Last 16 values from qh (4 bytes × 4 per byte, 2-bit) */
+    for (int i = 0; i < 4 && idx < 256; i++) {
+        uint8_t byte_val = tq->qh[i];
+        for (int j = 0; j < 4 && idx < 256; j++) {
+            int v = (byte_val >> (j * 2)) & 3;
+            tmp[idx++] = (int8_t)(v - 1);  /* 0→-1, 1→0, 2→+1, 3→+2(clamp) */
+        }
+    }
+
+    /* Pack into Q8_0 blocks (32 elements each) */
+    int nb = (n + 31) / 32;
+    for (int b = 0; b < nb; b++) {
+        out_q8[b].d = tq->d;  /* same scale as TQ1_0 */
+        int base = b * 32;
+        for (int i = 0; i < 32; i++) {
+            int idx_q = base + i;
+            out_q8[b].qs[i] = (idx_q < n) ? tmp[idx_q] : 0;
+        }
+    }
+    return n;
+}
+
 /* ═══════════════════════════════════════════════════════════════
  * NEON: Q8_0 Matmul — y[O] = x[I] @ W^T
  *
@@ -293,17 +513,45 @@ void ct_matmul_q8_0(float* y, const float* x,
             }
         }
         y[j] = vaddvq_f32(vacc);
-
-        /* Scalar remainder for partial last block */
-        int rem_start = blk_per_I * 32;
-        if (rem_start > I) rem_start = I - 32;
-        if (rem_start < 0) rem_start = 0;
-        for (int i = rem_start; i < I; i++) {
-            int b = i / 32;
-            int k = i % 32;
-            y[j] += x[i] * fp16_to_f32(row[b].d) * row[b].qs[k];
-        }
     }
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * NEON: TQ1_0 Matmul via Q8_0 path
+ *
+ * Dequantizes TQ1_0 → Q8_0 blocks on-the-fly, then delegates to
+ * the NEON-optimized ct_matmul_q8_0(). Reuses existing SIMD code.
+ * ═══════════════════════════════════════════════════════════════ */
+
+void ct_matmul_tq1_0(float* y, const float* x,
+                      const ct_block_tq1_0* W, int I, int O) {
+    int nb_per_row_tq = (I + 255) / 256;
+
+    /* Temporary Q8_0 buffer for one row */
+    int max_q8_blocks = (I + 31) / 32;
+    ct_block_q8_0* q8_buf = (ct_block_q8_0*)malloc((size_t)max_q8_blocks * CT_SIZEOF_Q8_0);
+    if (!q8_buf) {
+        memset(y, 0, (size_t)O * sizeof(float));
+        return;
+    }
+
+    for (int j = 0; j < O; j++) {
+        const ct_block_tq1_0* tq_row = W + (int64_t)j * nb_per_row_tq;
+        int q8_count = 0;
+
+        /* Dequant all TQ1_0 blocks in this row → Q8_0 blocks */
+        for (int b = 0; b < nb_per_row_tq; b++) {
+            int cols_in_block = I - b * 256;
+            if (cols_in_block <= 0) break;
+            dequant_tq1_0_to_q8_0(&tq_row[b], &q8_buf[q8_count], cols_in_block);
+            q8_count += (cols_in_block + 31) / 32;
+        }
+
+        /* Run NEON Q8_0 matmul for this output row */
+        ct_matmul_q8_0(y + j, x, q8_buf, I, 1);
+    }
+
+    free(q8_buf);
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -399,58 +647,6 @@ void ct_matmul_bq1_0(float* y, const float* x,
 }
 
 /* ═══════════════════════════════════════════════════════════════
- * NEON: TQ1_0 Matmul — ternary {−1,0,+1} with base-3 packing
- *
- * 256 weights per block, stored as [O][I].
- * Each output row j has ceil(I/256) blocks.
- * Each block: 48 bytes qs (240 vals, 5/byte base-3)
- * + 4 bytes qh (16 vals, 4/byte 2-bit) + FP16 scale
- * y[j] = Σ_b d_b * ( Σ_{i in block} x[i] * decode(block[i]) )
- * ═══════════════════════════════════════════════════════════════ */
-
-void ct_matmul_tq1_0(float* y, const float* x,
-                      const ct_block_tq1_0* W, int I, int O) {
-    int nb_per_row = (I + 255) / 256;
-
-    for (int j = 0; j < O; j++) {
-        const ct_block_tq1_0* row = W + (int64_t)j * nb_per_row;
-        float sum = 0.0f;
-
-        for (int b = 0; b < nb_per_row; b++) {
-            float d = fp16_to_f32(row[b].d);
-            int i0 = b * 256;
-
-            /* Decode first 240 values (48 bytes × 5 per byte) */
-            int idx = 0;
-            int n = (I - i0 < 256) ? I - i0 : 256;
-            for (int j2 = 0; j2 < 48 && idx < n; j2++) {
-                int tmp = row[b].qs[j2];
-                for (int k = 0; k < 5 && idx < n; k++) {
-                    int v = (tmp % 3) - 1;
-                    tmp /= 3;
-                    if (v != 0)
-                        sum += x[i0 + idx] * d * (float)v;
-                    idx++;
-                }
-            }
-            /* Last 16 values from qh (4 bytes × 4 per byte, 2-bit) */
-            for (int j2 = 0; j2 < 4 && idx < n; j2++) {
-                uint8_t byte_val = row[b].qh[j2];
-                for (int k = 0; k < 4 && idx < n; k++) {
-                    int v = (byte_val >> (k * 2)) & 3;
-                    if (v != 1) {
-                        float sv = (v == 2) ? 1.0f : -1.0f;
-                        sum += x[i0 + idx] * d * sv;
-                    }
-                    idx++;
-                }
-            }
-        }
-        y[j] = sum;
-    }
-}
-
-/* ═══════════════════════════════════════════════════════════════
  * NEON: Batch Matmul — y[n][O] = x[n][I] @ W^T
  *
  * For n_tokens > 1, processes all tokens against the same weight matrix.
@@ -507,7 +703,7 @@ void ct_quant_init(void) {
     ct_fp16_init();
 }
 
-#else  /* !__ARM_NEON — scalar fallback */
+#elif !defined(__AVX2__)  /* scalar fallback (no SIMD at all) */
 
 /* ── Scalar implementations for non-ARM platforms ── */
 
@@ -686,4 +882,222 @@ void ct_matmul_batch_tq1_0(float* y, const float* x, int n_tokens,
         ct_matmul_tq1_0(y + (int64_t)t * O, x + (int64_t)t * I, W, I, O);
 }
 
-#endif /* __ARM_NEON */
+#endif /* __ARM_NEON / !__AVX2__ */
+
+/* ═══════════════════════════════════════════════════════════════
+ * x86 AVX2: Quantized Matmul Kernels
+ *
+ * Each function replaces the scalar fallback when compiled with
+ * -mavx2 -mfma (automatically defines __AVX2__).
+ * ═══════════════════════════════════════════════════════════════ */
+#ifdef __AVX2__
+
+#include <immintrin.h>
+
+/* ─── Utility: horizontal sum of __m256 ─── */
+static inline float hsum_ps(__m256 v) {
+    __m128 lo = _mm256_castps256_ps128(v);
+    __m128 hi = _mm256_extractf128_ps(v, 1);
+    __m128 sum = _mm_add_ps(lo, hi);
+    __m128 shuf = _mm_movehdup_ps(sum);
+    sum = _mm_add_ps(sum, shuf);
+    shuf = _mm_movehl_ps(shuf, sum);
+    sum = _mm_add_ss(sum, shuf);
+    return _mm_cvtss_f32(sum);
+}
+
+/* ─── AVX2: Q8_0 Matmul ─── */
+void ct_matmul_q8_0(float* y, const float* x,
+                     const ct_block_q8_0* W, int I, int O) {
+    int blk_per_I = (I + 31) / 32;
+
+    for (int j = 0; j < O; j++) {
+        const ct_block_q8_0* row = W + (int64_t)j * blk_per_I;
+        __m256 vacc = _mm256_setzero_ps();
+
+        for (int b = 0; b < blk_per_I; b++) {
+            float d = fp16_to_f32(row[b].d);
+            __m256 dv = _mm256_set1_ps(d);
+            int i0 = b * 32;
+
+            for (int g = 0; g < 4; g++) {
+                int ii = i0 + g * 8;
+                if (ii + 8 > I) break;
+
+                /* Load 8 int8 weights, sign-extend to int32, convert to float */
+                __m128i w8 = _mm_loadl_epi64((const __m128i*)(row[b].qs + g * 8));
+                __m128i w32_lo = _mm_cvtepi8_epi32(w8);
+                __m128i w32_hi = _mm_cvtepi8_epi32(_mm_srli_si128(w8, 4));
+                __m128 wf_lo = _mm_cvtepi32_ps(w32_lo);
+                __m128 wf_hi = _mm_cvtepi32_ps(w32_hi);
+                __m256 wf = _mm256_set_m128(wf_hi, wf_lo);
+
+                __m256 xv = _mm256_loadu_ps(x + ii);
+                vacc = _mm256_fmadd_ps(xv, _mm256_mul_ps(dv, wf), vacc);
+            }
+        }
+
+        /* Horizontal sum */
+        y[j] = hsum_ps(vacc);
+
+        /* Scalar remainder for partial last block */
+        int rem_start = blk_per_I * 32;
+        if (rem_start > I) rem_start = I - 32;
+        if (rem_start < 0) rem_start = 0;
+        for (int i = rem_start; i < I; i++) {
+            int b = i / 32;
+            int k = i % 32;
+            y[j] += x[i] * fp16_to_f32(row[b].d) * row[b].qs[k];
+        }
+    }
+}
+
+/* ─── AVX2: Q4_0 Matmul ─── */
+void ct_matmul_q4_0(float* y, const float* x,
+                     const ct_block_q4_0* W, int I, int O) {
+    int blk_per_I = (I + 31) / 32;
+
+    for (int j = 0; j < O; j++) {
+        const ct_block_q4_0* row = W + (int64_t)j * blk_per_I;
+        __m256 vacc = _mm256_setzero_ps();
+
+        for (int b = 0; b < blk_per_I; b++) {
+            float d = fp16_to_f32(row[b].d);
+            __m256 dv = _mm256_set1_ps(d);
+            int i0 = b * 32;
+
+            /* Unpack nibbles to int8 (subtract 8 for signedness) */
+            int8_t qs[32];
+            for (int k = 0; k < 16; k++) {
+                qs[k * 2]     = (int8_t)((row[b].qs[k] & 0x0F) - 8);
+                qs[k * 2 + 1] = (int8_t)((row[b].qs[k] >> 4) - 8);
+            }
+
+            for (int g = 0; g < 4; g++) {
+                int ii = i0 + g * 8;
+                if (ii + 8 > I) break;
+
+                __m128i w8 = _mm_loadl_epi64((const __m128i*)(qs + g * 8));
+                __m128i w32_lo = _mm_cvtepi8_epi32(w8);
+                __m128i w32_hi = _mm_cvtepi8_epi32(_mm_srli_si128(w8, 4));
+                __m128 wf_lo = _mm_cvtepi32_ps(w32_lo);
+                __m128 wf_hi = _mm_cvtepi32_ps(w32_hi);
+                __m256 wf = _mm256_set_m128(wf_hi, wf_lo);
+
+                __m256 xv = _mm256_loadu_ps(x + ii);
+                vacc = _mm256_fmadd_ps(xv, _mm256_mul_ps(dv, wf), vacc);
+            }
+        }
+
+        y[j] = hsum_ps(vacc);
+
+        /* Scalar remainder for partial last block */
+        int rem_start = blk_per_I * 32;
+        if (rem_start > I) rem_start = I - 32;
+        if (rem_start < 0) rem_start = 0;
+        for (int i = rem_start; i < I; i++) {
+            int b = i / 32;
+            int k = i % 32;
+            int nib = (row[b].qs[k >> 1] >> ((k & 1) << 2)) & 0xF;
+            y[j] += x[i] * fp16_to_f32(row[b].d) * ((float)nib - 8.0f);
+        }
+    }
+}
+
+/* ─── AVX2: BQ1_0 Matmul (scalar — bit-by-bit, same as fallback) ─── */
+void ct_matmul_bq1_0(float* y, const float* x,
+                      const ct_block_bq1_0* W, int I, int O) {
+    int ng_per_row = (I + 127) / 128;
+    for (int j = 0; j < O; j++) {
+        const ct_block_bq1_0* row = W + (int64_t)j * ng_per_row;
+        float sum = 0.0f;
+        for (int g = 0; g < ng_per_row; g++) {
+            float d = fp16_to_f32(row[g].d);
+            uint64_t bits0 = row[g].bits[0];
+            uint64_t bits1 = row[g].bits[1];
+            int i0 = g * 128;
+            int n = (I - i0 < 128) ? I - i0 : 128;
+            int half_n = (n < 64) ? n : 64;
+            for (int k = 0; k < half_n; k++)
+                sum += x[i0 + k] * ((bits0 >> k) & 1 ? d : -d);
+            for (int k = 0; k < n - 64; k++)
+                sum += x[i0 + 64 + k] * ((bits1 >> k) & 1 ? d : -d);
+        }
+        y[j] = sum;
+    }
+}
+
+/* ─── AVX2: TQ1_0 Matmul (scalar — ternary decode, same as fallback) ─── */
+void ct_matmul_tq1_0(float* y, const float* x,
+                      const ct_block_tq1_0* W, int I, int O) {
+    int nb_per_row = (I + 255) / 256;
+    for (int j = 0; j < O; j++) {
+        const ct_block_tq1_0* row = W + (int64_t)j * nb_per_row;
+        float sum = 0.0f;
+        for (int b = 0; b < nb_per_row; b++) {
+            float d = fp16_to_f32(row[b].d);
+            int i0 = b * 256;
+            int idx = 0;
+            int n = (I - i0 < 256) ? I - i0 : 256;
+            for (int j2 = 0; j2 < 48 && idx < n; j2++) {
+                int tmp = row[b].qs[j2];
+                for (int k = 0; k < 5 && idx < n; k++) {
+                    int v = (tmp % 3) - 1;
+                    tmp /= 3;
+                    if (v != 0) sum += x[i0 + idx] * d * (float)v;
+                    idx++;
+                }
+            }
+            for (int j2 = 0; j2 < 4 && idx < n; j2++) {
+                uint8_t byte_val = row[b].qh[j2];
+                for (int k = 0; k < 4 && idx < n; k++) {
+                    int v = (byte_val >> (k * 2)) & 3;
+                    if (v != 1) {
+                        float sv = (v == 2) ? 1.0f : -1.0f;
+                        sum += x[i0 + idx] * d * sv;
+                    }
+                    idx++;
+                }
+            }
+        }
+        y[j] = sum;
+    }
+}
+
+/* ─── AVX2: F32 Matmul (simple, no SIMD needed) ─── */
+void ct_matmul_f32(float* y, const float* x, const float* W, int I, int O) {
+    for (int o = 0; o < O; o++) {
+        const float* wrow = W + (int64_t)o * I;
+        __m256 acc = _mm256_setzero_ps();
+        int i = 0;
+        for (; i + 8 <= I; i += 8)
+            acc = _mm256_fmadd_ps(_mm256_loadu_ps(x + i), _mm256_loadu_ps(wrow + i), acc);
+        float sum = hsum_ps(acc);
+        for (; i < I; i++) sum += x[i] * wrow[i];
+        y[o] = sum;
+    }
+}
+
+/* ─── AVX2: Batch Matmul Wrappers ─── */
+void ct_matmul_batch_q8_0(float* y, const float* x, int n_tokens,
+                           const ct_block_q8_0* W, int I, int O) {
+    for (int t = 0; t < n_tokens; t++)
+        ct_matmul_q8_0(y + (int64_t)t * O, x + (int64_t)t * I, W, I, O);
+}
+void ct_matmul_batch_q4_0(float* y, const float* x, int n_tokens,
+                           const ct_block_q4_0* W, int I, int O) {
+    for (int t = 0; t < n_tokens; t++)
+        ct_matmul_q4_0(y + (int64_t)t * O, x + (int64_t)t * I, W, I, O);
+}
+void ct_matmul_batch_bq1_0(float* y, const float* x, int n_tokens,
+                            const ct_block_bq1_0* W, int I, int O) {
+    for (int t = 0; t < n_tokens; t++)
+        ct_matmul_bq1_0(y + (int64_t)t * O, x + (int64_t)t * I, W, I, O);
+}
+void ct_matmul_batch_tq1_0(float* y, const float* x, int n_tokens,
+                            const ct_block_tq1_0* W, int I, int O) {
+    for (int t = 0; t < n_tokens; t++)
+        ct_matmul_tq1_0(y + (int64_t)t * O, x + (int64_t)t * I, W, I, O);
+}
+
+#endif /* __AVX2__ */

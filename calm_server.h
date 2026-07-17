@@ -9,6 +9,7 @@ typedef struct {
     char path[1024];
     char body[65536];
     size_t body_len;
+    int keep_alive;          /* 1 = Connection: keep-alive */
 } ct_http_request;
 
 /* ─── Route handler ───
@@ -28,5 +29,13 @@ typedef int (*ct_route_handler)(const char* path, const char* method,
  * Port 0 = default 8080.
  */
 int ct_server_start(int port, ct_route_handler handler, void* user_data);
+
+/* ─── SSE streaming handler ───
+ * Called from server when stream=true in request body.
+ * Writes SSE events to fd, then writes [DONE]. Caller closes fd.
+ * Returns 0 on success, -1 on error.
+ * user_data must be the same as passed to ct_server_start.
+ */
+int calm_serve_sse(int fd, const char* body, void* user_data);
 
 #endif /* CALM_SERVER_H */

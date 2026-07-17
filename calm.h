@@ -286,6 +286,9 @@ typedef struct {
     void (*on_token)(const char* token, void* user_data);
     void* user_data;
 
+    /* JSON mode: constrain output to valid JSON */
+    bool json_mode;
+
     /* Tool/function calling (см. calm_tools.h) */
     const void* tools;           /* CalmToolDefinitions* */
     int max_tool_rounds;         /* max iterations (default 5) */

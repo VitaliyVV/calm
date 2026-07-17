@@ -36,6 +36,7 @@
 #include <sys/statvfs.h>
 #include <time.h>
 #include <unistd.h>
+#include <signal.h>
 
 /* ═══════════════════════════════════════════════════════════════
  * Внутренние константы
@@ -1191,6 +1192,7 @@ struct CalmModel {
     // Статистика
     double gen_start_time;
     int tokens_generated;
+    int prompt_tokens;           // last prompt token count (for API response)
 };
 
 CalmRuntime* calm_init(const CalmDevice* device) {
@@ -1567,6 +1569,22 @@ static int execute_tool_round(CalmToolCall* calls, int n_calls,
 }
 
 /* ─── Native inference with tool calling support ─── */
+
+/* Helper struct for streaming token decode */
+struct stream_decode_ctx {
+    ct_tokenizer* tok;
+    void (*user_cb)(const char*, void*);
+    void* user_arg;
+};
+
+/* Stream callback: ct_infer_generate calls this per token → decode to text → call user cb */
+static void stream_token_to_text(int token, void* ctx) {
+    struct stream_decode_ctx* sc = (struct stream_decode_ctx*)ctx;
+    char buf[128];
+    ct_tokenizer_decode_single(sc->tok, token, buf, sizeof(buf));
+    if (sc->user_cb) sc->user_cb(buf, sc->user_arg);
+}
+
 CalmError calm_model_generate_native(CalmModel* model,
                                            const char* prompt,
                                            char* output,
@@ -1581,6 +1599,9 @@ CalmError calm_model_generate_native(CalmModel* model,
     if (max_tokens > 512) max_tokens = 512;  // increased for tool calling
 
     float temp = params ? params->temperature : 0.7f;
+    float top_p_val = params ? params->top_p : 1.0f;
+    float rp_val = params ? params->repeat_penalty : 1.0f;
+    int top_k_val = params ? (int)params->top_k : 0;
     const CalmToolDefinitions* tools = params ? (const CalmToolDefinitions*)params->tools : NULL;
     int max_rounds = params ? params->max_tool_rounds : 5;
     if (max_rounds < 1) max_rounds = 1;
@@ -1593,7 +1614,8 @@ CalmError calm_model_generate_native(CalmModel* model,
             in_token = atoi(prompt);
         int tokens[64] = {in_token};
         int eos_id = -1;
-        int total = ct_infer_generate(s, tokens, 1, max_tokens, temp, eos_id, tokens);
+        int total = ct_infer_generate(s, tokens, 1, max_tokens, temp, eos_id, tokens, NULL, NULL,
+                                       1.0f, 1.0f, 0);
         if (total < 1) {
             snprintf(output, output_size, "Inference failed.\n");
             return CALM_ERR_GENERIC;
@@ -1605,14 +1627,27 @@ CalmError calm_model_generate_native(CalmModel* model,
     /* ── Build initial chat prompt ── */
     int tokens[4096];
     int n_prompt = build_chat_prompt(model->tokenizer, prompt, tools, tokens, 2048);
+    model->prompt_tokens = n_prompt;
     int eos_id = model->tokenizer->eos_id;
 
     /* ── Tool calling loop ── */
     int has_tools = (tools && tools->count > 0);
     int round = 0;
 
+    /* Setup streaming callback if requested (no tools = single round, safe to stream) */
+    struct stream_decode_ctx stream_data;
+    int should_stream = params && params->on_token && !has_tools;
+    if (should_stream) {
+        stream_data.tok = model->tokenizer;
+        stream_data.user_cb = params->on_token;
+        stream_data.user_arg = params->user_data;
+    }
+
     /* Helper: re-encode full_history and generate */
-    int total = ct_infer_generate(s, tokens, n_prompt, max_tokens, temp, eos_id, tokens);
+    int total = ct_infer_generate(s, tokens, n_prompt, max_tokens, temp, eos_id, tokens,
+                                   should_stream ? stream_token_to_text : NULL,
+                                   should_stream ? &stream_data : NULL,
+                                   top_p_val, rp_val, top_k_val);
 
     if (total < 1) {
         snprintf(output, output_size, "Inference failed.\n");
@@ -1712,7 +1747,8 @@ CalmError calm_model_generate_native(CalmModel* model,
         if (n_prompt < 1) break;
         if (n_prompt >= 2048) n_prompt = 2048 - 1;
 
-        total = ct_infer_generate(s, tokens, n_prompt, max_tokens, temp, eos_id, tokens);
+        total = ct_infer_generate(s, tokens, n_prompt, max_tokens, temp, eos_id, tokens, NULL, NULL,
+                                   top_p_val, rp_val, top_k_val);
         if (total < 1) break;
 
         model->tokens_generated = total - n_prompt;
@@ -1995,7 +2031,18 @@ typedef struct {
     CalmModel* model;
     CalmToolDefinitions* tools;
     pthread_mutex_t mutex;
+    char display_name[256]; /* optional display name, defaults to filename */
 } serve_ctx;
+
+/* Debug log: writes to /tmp/calm_debug.log with timestamp */
+static void debug_log(const char* msg) {
+    FILE* f = fopen("/data/data/com.termux/files/usr/tmp/calm_debug.log", "a");
+    if (!f) return;
+    time_t t = time(NULL);
+    struct tm* tm = localtime(&t);
+    fprintf(f, "[%02d:%02d:%02d] %s\n", tm->tm_hour, tm->tm_min, tm->tm_sec, msg);
+    fclose(f);
+}
 
 /* Escape string for JSON (minimal — handles chars that break JSON) */
 static void json_escape(const char* in, char* out, size_t out_size) {
@@ -2020,7 +2067,113 @@ static void json_escape(const char* in, char* out, size_t out_size) {
     out[j] = '\0';
 }
 
-/* ─── /v1/completions handler (OpenAI API compatible) ─── */
+/* ─── /v1/completions + /v1/chat/completions handler (OpenAI API compatible) ─── */
+
+/* Format messages array into a ChatML prompt.
+ * Returns pointer to static buffer, NULL on error.
+ * For Qwen2.5, the format is:
+ *   <|im_start|>system\n{msg}<|im_end|>\n
+ *   <|im_start|>user\n{msg}<|im_end|>\n
+ *   <|im_start|>assistant\n{msg}<|im_end|>\n
+ *   ...
+ *   <|im_start|>assistant\n
+ */
+static const char* format_chatml(const char* body, char* out, size_t out_size) {
+    if (!body || !out || out_size < 16) return NULL;
+    out[0] = '\0';
+
+    /* Local whitespace skipper */
+    #define SKIP_WS(p) do { while (*(p) && (unsigned char)*(p) <= ' ') (p)++; } while(0)
+
+    /* Find the messages array */
+    const char* arr = ct_json_get_value(body, "messages");
+    if (!arr || *arr != '[') return NULL;
+    arr++; /* skip [ */
+
+    const char* p = arr;
+    char role[64];
+    char content[CALM_MAX_STRING];
+    size_t written = 0;
+    int found = 0;
+
+    while (*p) {
+        SKIP_WS(p);
+        if (!*p || *p == ']') break;
+
+        if (*p == ',') { p++; continue; }
+
+        if (*p == '{') {
+            /* Find end of this object */
+            const char* obj_end = p;
+            int obj_depth = 0;
+            while (*obj_end) {
+                if (*obj_end == '{') { obj_depth++; obj_end++; }
+                else if (*obj_end == '}') { obj_depth--; obj_end++; if (obj_depth == 0) break; }
+                else if (*obj_end == '"') {
+                    obj_end++;
+                    while (*obj_end) {
+                        if (*obj_end == '\\') { if (obj_end[1]) obj_end += 2; else break; }
+                        else if (*obj_end == '"') { obj_end++; break; }
+                        else obj_end++;
+                    }
+                } else obj_end++;
+            }
+
+            /* Extract this object */
+            size_t obj_len = (size_t)(obj_end - p);
+            if (obj_len < 2) { p = obj_end; continue; }
+            char obj_buf[8192];
+            if (obj_len >= sizeof(obj_buf)) { p = obj_end; continue; }
+            memcpy(obj_buf, p, obj_len);
+            obj_buf[obj_len] = '\0';
+
+            /* Get role */
+            const char* rv = ct_json_get_string(obj_buf, "role");
+            if (!rv) { p = obj_end; continue; }
+            size_t rl = strlen(rv);
+            if (rl >= sizeof(role)) rl = sizeof(role) - 1;
+            memcpy(role, rv, rl);
+            role[rl] = '\0';
+
+            /* Get content (optional for assistant — the model response) */
+            const char* cv = ct_json_get_string(obj_buf, "content");
+            if (!cv) cv = "";
+            size_t cl = strlen(cv);
+            if (cl >= sizeof(content)) cl = sizeof(content) - 1;
+            memcpy(content, cv, cl);
+            content[cl] = '\0';
+
+            /* Format: <|im_start|>role\ncontent<|im_end|>\n */
+            int n = snprintf(out + written, out_size - written,
+                "<|im_start|>%s\n%s<|im_end|>\n", role, content);
+            if (n < 0 || (size_t)n >= out_size - written) break;
+            written += (size_t)n;
+            found = 1;
+
+            p = obj_end;
+            continue;
+        }
+        p++;
+    }
+
+    /* Append the final assistant turn header */
+    if (found) {
+        snprintf(out + written, out_size - written, "<|im_start|>assistant\n");
+    }
+
+    #undef SKIP_WS
+    return out;
+}
+
+/* Forward declaration for SSE */
+static void json_escape(const char* in, char* out, size_t out_size);
+static int gen_completions(serve_ctx* ctx, const char* prompt,
+                           char* response_body, size_t response_size,
+                           int* out_status_code, const char** out_content_type,
+                           int max_tokens, float temperature, float top_p,
+                           float top_k, float repeat_penalty, int is_chat,
+                           int json_mode);
+
 static int handle_v1_completions(const char* path, const char* method,
                                   const char* body,
                                   char* response_body, size_t response_size,
@@ -2029,27 +2182,62 @@ static int handle_v1_completions(const char* path, const char* method,
                                   void* user_data) {
     serve_ctx* ctx = (serve_ctx*)user_data;
 
-    /* Route: only POST /v1/completions */
-    if (strcmp(path, "/v1/completions") != 0) {
-        *out_status_code = 404;
-        snprintf(response_body, response_size, "{\"error\":\"not found\"}");
+    debug_log("handle_v1_completions enter");
+
+    /* /v1/models — list available models */
+    if (strcmp(path, "/v1/models") == 0) {
+        *out_status_code = 200;
+        *out_content_type = "application/json";
+        snprintf(response_body, response_size,
+            "{"
+            "\"object\":\"list\","
+            "\"data\":[{"
+                "\"id\":\"%s\","
+                "\"object\":\"model\","
+                "\"created\":%ld,"
+                "\"owned_by\":\"calm\""
+            "}]"
+            "}", ctx->display_name, (long)time(NULL));
         return 0;
     }
+
     if (strcmp(method, "POST") != 0) {
         *out_status_code = 405;
         snprintf(response_body, response_size, "{\"error\":\"method not allowed\"}");
         return 0;
     }
 
-    /* Parse required field: prompt */
-    const char* prompt = ct_json_get_string(body, "prompt");
-    if (!prompt) {
-        *out_status_code = 400;
-        snprintf(response_body, response_size, "{\"error\":\"missing 'prompt' field\"}");
+    /* Parse common params */
+    char prompt_buf[CALM_MAX_STRING] = {0};
+    int is_chat = 0;
+
+    if (strcmp(path, "/v1/chat/completions") == 0) {
+        /* Parse messages array → ChatML prompt */
+        if (!format_chatml(body, prompt_buf, sizeof(prompt_buf)) || !prompt_buf[0]) {
+            *out_status_code = 400;
+            snprintf(response_body, response_size,
+                     "{\"error\":\"missing or invalid 'messages' field\"}");
+            return 0;
+        }
+        is_chat = 1;
+    } else if (strcmp(path, "/v1/completions") == 0) {
+        const char* pv = ct_json_get_string(body, "prompt");
+        if (!pv) {
+            *out_status_code = 400;
+            snprintf(response_body, response_size,
+                     "{\"error\":\"missing 'prompt' field\"}");
+            return 0;
+        }
+        size_t pl = strlen(pv);
+        if (pl >= sizeof(prompt_buf)) pl = sizeof(prompt_buf) - 1;
+        memcpy(prompt_buf, pv, pl);
+        prompt_buf[pl] = '\0';
+    } else {
+        *out_status_code = 404;
+        snprintf(response_body, response_size, "{\"error\":\"not found\"}");
         return 0;
     }
 
-    /* Parse optional generation params */
     int max_tokens = ct_json_get_int(body, "max_tokens", 64);
     if (max_tokens < 1) max_tokens = 1;
     if (max_tokens > 512) max_tokens = 512;
@@ -2060,7 +2248,51 @@ static int handle_v1_completions(const char* path, const char* method,
     float repeat_penalty = ct_json_get_float(body, "repeat_penalty", 1.1f);
     (void)ct_json_get_int(body, "echo", 0); /* echo not yet implemented */
 
-    /* Generate */
+    /* JSON mode: check for response_format.type == "json_object" */
+    int json_mode = 0;
+    const char* rf_val = ct_json_get_value(body, "response_format");
+    if (rf_val) {
+        char rf_copy[2048];
+        size_t rfl = strlen(rf_val);
+        if (rfl >= sizeof(rf_copy)) rfl = sizeof(rf_copy) - 1;
+        memcpy(rf_copy, rf_val, rfl);
+        rf_copy[rfl] = '\0';
+        const char* rft = ct_json_get_string(rf_copy, "type");
+        if (rft && strcmp(rft, "json_object") == 0) {
+            json_mode = 1;
+            /* Inject JSON instruction into prompt */
+            if (is_chat && strstr(prompt_buf, "<|im_start|>system") == NULL) {
+                char tmp[CALM_MAX_STRING];
+                snprintf(tmp, sizeof(tmp),
+                    "<|im_start|>system\nYou must respond in valid JSON format only, with no additional text before or after the JSON.<|im_end|>\n%s",
+                    prompt_buf);
+                strncpy(prompt_buf, tmp, sizeof(prompt_buf) - 1);
+                prompt_buf[sizeof(prompt_buf) - 1] = '\0';
+            } else if (!is_chat) {
+                char tmp[CALM_MAX_STRING];
+                snprintf(tmp, sizeof(tmp),
+                    "Return your response in valid JSON format.\n\n%s",
+                    prompt_buf);
+                strncpy(prompt_buf, tmp, sizeof(prompt_buf) - 1);
+                prompt_buf[sizeof(prompt_buf) - 1] = '\0';
+            }
+        }
+    }
+
+    return gen_completions(ctx, prompt_buf, response_body, response_size,
+                           out_status_code, out_content_type,
+                           max_tokens, temperature, top_p, top_k,
+                           repeat_penalty, is_chat, json_mode);
+}
+
+/* Generate a completion (shared by both /v1/completions and /v1/chat/completions) */
+static int gen_completions(serve_ctx* ctx, const char* prompt,
+                           char* response_body, size_t response_size,
+                           int* out_status_code, const char** out_content_type,
+                           int max_tokens, float temperature, float top_p,
+                           float top_k, float repeat_penalty, int is_chat,
+                           int json_mode) {
+
     CalmGenerateParams params = {
         .temperature = temperature,
         .top_p = top_p,
@@ -2068,6 +2300,7 @@ static int handle_v1_completions(const char* path, const char* method,
         .repeat_penalty = repeat_penalty,
         .max_tokens = max_tokens,
         .stream = false,
+        .json_mode = (bool)json_mode,
         .tools = (ctx->tools && ctx->tools->count > 0) ? ctx->tools : NULL,
         .max_tool_rounds = 5,
     };
@@ -2085,39 +2318,167 @@ static int handle_v1_completions(const char* path, const char* method,
         return 0;
     }
 
-    /* Token counts */
     int completion_tokens = ctx->model->tokens_generated;
     if (completion_tokens < 0) completion_tokens = 0;
+    int prompt_tokens = ctx->model->prompt_tokens;
+    if (prompt_tokens < 0) prompt_tokens = 0;
 
-    /* Build JSON response (OpenAI /v1/completions format) */
     time_t now = time(NULL);
     char escaped[CALM_MAX_OUTPUT * 2];
     json_escape(output, escaped, sizeof(escaped));
 
-    snprintf(response_body, response_size,
-        "{"
-        "\"id\":\"cmpl-%ld\","
-        "\"object\":\"text_completion\","
-        "\"created\":%ld,"
-        "\"model\":\"%s\","
-        "\"choices\":[{"
-            "\"text\":\"%s\","
-            "\"index\":0,"
-            "\"finish_reason\":\"stop\""
-        "}],"
-        "\"usage\":{"
-            "\"prompt_tokens\":0,"
-            "\"completion_tokens\":%d,"
-            "\"total_tokens\":%d"
-        "}"
-        "}",
-        (long)now, (long)now,
-        ctx->model->path,
-        escaped,
-        completion_tokens, completion_tokens);
+    if (is_chat) {
+        /* OpenAI /v1/chat/completions format */
+        snprintf(response_body, response_size,
+            "{"
+            "\"id\":\"chatcmpl-%ld\","
+            "\"created\":%ld,"
+            "\"model\":\"%s\","
+            "\"choices\":[{"
+                "\"index\":0,"
+                "\"message\":{"
+                    "\"role\":\"assistant\","
+                    "\"content\":\"%s\""
+                "},"
+                "\"finish_reason\":\"stop\""
+            "}],"
+            "\"usage\":{"
+                "\"prompt_tokens\":%d,"
+                "\"completion_tokens\":%d,"
+                "\"total_tokens\":%d"
+            "}"
+            "}",
+            (long)now, (long)now,
+            ctx->display_name,
+            escaped,
+            prompt_tokens, completion_tokens, prompt_tokens + completion_tokens);
+    } else {
+        /* OpenAI /v1/completions format */
+        snprintf(response_body, response_size,
+            "{"
+            "\"id\":\"cmpl-%ld\","
+            "\"object\":\"text_completion\","
+            "\"created\":%ld,"
+            "\"model\":\"%s\","
+            "\"choices\":[{"
+                "\"text\":\"%s\","
+                "\"index\":0,"
+                "\"finish_reason\":\"stop\""
+            "}],"
+            "\"usage\":{"
+                "\"prompt_tokens\":%d,"
+                "\"completion_tokens\":%d,"
+                "\"total_tokens\":%d"
+            "}"
+            "}",
+            (long)now, (long)now,
+            ctx->display_name,
+            escaped,
+            prompt_tokens, completion_tokens, prompt_tokens + completion_tokens);
+    }
 
     *out_status_code = 200;
     *out_content_type = "application/json";
+    return 0;
+}
+
+typedef struct {
+    int fd;
+    int index;
+    char buf[64]; /* partial token buffer for cleanup */
+} sse_write_ctx;
+
+static void sse_event_cb(const char* text, void* user_data) {
+    sse_write_ctx* sse = (sse_write_ctx*)user_data;
+    if (!text || !text[0]) return;
+    /* JSON-escape the token text */
+    char escaped[2048];
+    json_escape(text, escaped, sizeof(escaped));
+    char sse_buf[4096];
+    int n = snprintf(sse_buf, sizeof(sse_buf),
+        "data: {\"choices\":[{\"text\":\"%s\",\"index\":%d}]}\n\n",
+        escaped, sse->index);
+    if (n > 0) write(sse->fd, sse_buf, (size_t)n);
+}
+
+int calm_serve_sse(int fd, const char* body, void* user_data) {
+    serve_ctx* ctx = (serve_ctx*)user_data;
+    if (!body || !body[0]) {
+        static const char err[] = "data: {\"error\":\"no request body\"}\n\n";
+        write(fd, err, strlen(err));
+        return -1;
+    }
+
+    char prompt[4096] = {0};
+
+    /* /v1/completions style: "prompt" field */
+    const char* pv = ct_json_get_string(body, "prompt");
+    if (pv) {
+        size_t pl = strlen(pv);
+        if (pl >= sizeof(prompt)) pl = sizeof(prompt) - 1;
+        memcpy(prompt, pv, pl);
+        prompt[pl] = '\0';
+    }
+
+    /* /v1/chat/completions style: "messages" array → ChatML */
+    if (!prompt[0] && ct_json_get_value(body, "messages")) {
+        format_chatml(body, prompt, sizeof(prompt));
+    }
+
+    if (!prompt[0]) {
+        static const char err[] = "data: {\"error\":\"missing prompt or messages\"}\n\n";
+        write(fd, err, strlen(err));
+        return -1;
+    }
+
+    int max_tokens = ct_json_get_int(body, "max_tokens", 64);
+    if (max_tokens < 1) max_tokens = 1;
+    if (max_tokens > 512) max_tokens = 512;
+    float temperature = ct_json_get_float(body, "temperature", 0.7f);
+    float top_p = ct_json_get_float(body, "top_p", 0.95f);
+    float top_k = ct_json_get_float(body, "top_k", 40.0f);
+    float repeat_penalty = ct_json_get_float(body, "repeat_penalty", 1.1f);
+
+    /* JSON mode for SSE */
+    int sse_json_mode = 0;
+    const char* sse_rf_val = ct_json_get_value(body, "response_format");
+    if (sse_rf_val) {
+        char rf_copy[2048];
+        size_t rfl = strlen(sse_rf_val);
+        if (rfl >= sizeof(rf_copy)) rfl = sizeof(rf_copy) - 1;
+        memcpy(rf_copy, sse_rf_val, rfl);
+        rf_copy[rfl] = '\0';
+        const char* rft = ct_json_get_string(rf_copy, "type");
+        if (rft && strcmp(rft, "json_object") == 0) sse_json_mode = 1;
+    }
+
+    sse_write_ctx sse_ctx = { .fd = fd, .index = 0 };
+
+    CalmGenerateParams params = {
+        .temperature = temperature,
+        .top_p = top_p,
+        .top_k = (int)top_k,
+        .repeat_penalty = repeat_penalty,
+        .max_tokens = max_tokens,
+        .stream = true,
+        .json_mode = (bool)sse_json_mode,
+        .on_token = sse_event_cb,
+        .user_data = &sse_ctx,
+        .tools = (ctx->tools && ctx->tools->count > 0) ? ctx->tools : NULL,
+        .max_tool_rounds = 5,
+    };
+
+    char output[CALM_MAX_OUTPUT] = {0};
+    CalmError err;
+
+    pthread_mutex_lock(&ctx->mutex);
+    err = calm_model_generate(ctx->model, prompt, output, sizeof(output), &params);
+    pthread_mutex_unlock(&ctx->mutex);
+
+    /* Send [DONE] marker */
+    write(fd, "data: [DONE]\n\n", 14);
+
+    if (err != CALM_OK) return -1;
     return 0;
 }
 
@@ -2140,6 +2501,7 @@ static void print_usage(const char* prog) {
     printf("       --max-tokens N         Max tokens to generate (default: 20, max: 512)\n");
     printf("  %s serve <model.gguf>      Start OpenAI-compatible HTTP server\n", prog);
     printf("       --port <port>          Port (default: 8080)\n");
+    printf("       --name <name>          Model display name (default: filename)\n");
     printf("       --tools <file.json>    Tool definitions (function calling)\n");
     printf("       (generation params set via JSON request body: temperature, top_p, top_k, repeat_penalty, max_tokens)\n");
     printf("  %s estimate <model.gguf>   Performance prediction\n", prog);
@@ -2148,6 +2510,7 @@ static void print_usage(const char* prog) {
     printf("       --output <file.gguf>  Output path\n");
     printf("  %s model info <model.gguf> Model analysis\n", prog);
     printf("  %s tokenize <model.gguf> <text>  Tokenize & decode text\n", prog);
+    printf("  %s download <url>         Download model from URL or HF repo ID\n", prog);
     printf("  %s --help                  This help\n", prog);
     printf("  %s --version               Version info\n", prog);
 }
@@ -2329,6 +2692,49 @@ int main(int argc, char** argv) {
             printf("  🌀 1-bit:      27B 1-bit (3.9 GB)\n");
 
         printf("\n");
+        return 0;
+    }
+
+    // ── download ──
+    if (strcmp(argv[1], "download") == 0) {
+        if (argc < 3) {
+            fprintf(stderr, "Usage: %s download <url> [output_filename]\n", argv[0]);
+            fprintf(stderr, "Downloads a model from Hugging Face or any HTTP(S) URL.\n");
+            fprintf(stderr, "  url    — Hugging Face repo ID or full URL\n");
+            fprintf(stderr, "  output — optional output filename (default: derived from URL)\n");
+            return 1;
+        }
+        const char* src = argv[2];
+        char url[4096];
+        if (strstr(src, "://")) {
+            strncpy(url, src, sizeof(url) - 1);
+        } else {
+            snprintf(url, sizeof(url),
+                "https://huggingface.co/%s/resolve/main/model.gguf", src);
+        }
+        char output[4096] = {0};
+        if (argc >= 4) {
+            strncpy(output, argv[3], sizeof(output) - 1);
+        } else {
+            const char* last_slash = strrchr(url, '/');
+            if (last_slash)
+                snprintf(output, sizeof(output), "%s", last_slash + 1);
+            else
+                snprintf(output, sizeof(output), "model.gguf");
+        }
+        printf("Downloading: %s\n", url);
+        printf("Output:      %s\n\n", output);
+        fflush(stdout);
+        char cmd[8192];
+        snprintf(cmd, sizeof(cmd), "curl -L --progress-bar -o '%s' '%s'", output, url);
+        int rc = system(cmd);
+        if (rc == 0) {
+            printf("\n✓ Downloaded to %s\n", output);
+        } else {
+            fprintf(stderr, "\n✗ Download failed (curl exit code %d)\n", rc);
+            fprintf(stderr, "Tip: Install curl or use: wget -O '%s' '%s'\n", output, url);
+            return 1;
+        }
         return 0;
     }
 
@@ -2548,12 +2954,15 @@ int main(int argc, char** argv) {
         // Parse extra args
         int port = 8080;
         const char* tools_path = NULL;
+        const char* model_name_arg = NULL;
         for (int i = 3; i < argc; i++) {
             if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
                 port = atoi(argv[++i]);
                 if (port <= 0 || port > 65535) port = 8080;
             } else if (strcmp(argv[i], "--tools") == 0 && i + 1 < argc) {
                 tools_path = argv[++i];
+            } else if (strcmp(argv[i], "--name") == 0 && i + 1 < argc) {
+                model_name_arg = argv[++i];
             }
         }
 
@@ -2584,6 +2993,16 @@ int main(int argc, char** argv) {
         ctx.model = model;
         ctx.tools = (tool_defs.count > 0) ? &tool_defs : NULL;
         pthread_mutex_init(&ctx.mutex, NULL);
+        // Set display name: use --name if given, else basename of model path
+        if (model_name_arg) {
+            snprintf(ctx.display_name, sizeof(ctx.display_name), "%s", model_name_arg);
+        } else {
+            const char* base = strrchr(model_path, '/');
+            base = base ? base + 1 : model_path;
+            snprintf(ctx.display_name, sizeof(ctx.display_name), "%s", base);
+            char* dot = strrchr(ctx.display_name, '.');
+            if (dot) *dot = '\0';
+        }
 
         // Start server (blocks until SIGINT)
         int ret = ct_server_start(port, handle_v1_completions, &ctx);

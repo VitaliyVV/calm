@@ -1,8 +1,8 @@
 # Calm — Zero-Dependency Local LLM Runtime
 
-**Pure C, no dependencies, runs anywhere.** GGUF → tokenization → inference → tool calling → HTTP API.
+**Pure C, no dependencies, runs anywhere.** GGUF → tokenization → inference → tool calling → HTTP API. **Optional Vulkan GPU compute backend** for quantized matmul acceleration on mobile GPUs.
 
-Built for ARM (phone, tablet, Raspberry Pi) and x86. Binary ~113 KB. Runs Qwen2.5 0.5B at ~5–10 tok/s on a Snapdragon 8+ Gen 1.
+Built for ARM (phone, tablet, Raspberry Pi) and x86. Binary ~113 KB. Runs Qwen2.5 0.5B at ~5–10 tok/s on a Snapdragon 8+ Gen 1 (CPU) or **~8–15 tok/s with Vulkan GPU offload**.
 
 ## Quick Start
 
@@ -134,6 +134,9 @@ The model can call functions via `<|tool_call|>` format (Qwen2.5 Instruct), and 
 | `calm_tools.c` | Function calling engine |
 | `calm_convert.c` | Model format converter |
 | `calm.h` | Public API |
+| `calm_vulkan.c` | Vulkan GPU compute backend (Q8_0 matmul offload) |
+| `calm_vulkan.h` | Vulkan backend API |
+| `shaders/q8_0_matmul.comp` | GLSL compute shader for Q8_0 batch matmul |
 
 ## Build from Source
 
@@ -142,12 +145,14 @@ The model can call functions via `<|tool_call|>` format (Qwen2.5 Instruct), and 
 - C11 compiler (clang or gcc)
 - POSIX system (Linux, Android/Termux, macOS, WSL)
 - No external libraries — just `-lm` for math
+- **Optional**: Vulkan headers + `glslangValidator` for GPU backend
 
 ### Build
 
 ```bash
 make                # Build calm + calm_convert
-make calm         # Build main binary only
+make calm           # Build main binary only
+make calm-vk        # Build with Vulkan GPU backend (ARM NEON)
 make clean          # Remove build artifacts
 ```
 
@@ -187,6 +192,7 @@ make clean          # Remove build artifacts
 ├─────────────────────────────────────────────┤
 │          Quantized Tensor Math              │
 │   Q4_0 / Q8_0 / BQ1_0 / TQ1_0 via NEON     │
+│   Q8_0 matmul via Vulkan compute (Adreno)   │
 ├─────────────────────────────────────────────┤
 │               GGUF Parser                   │
 │   Tensor loading, metadata, tokenizer       │
@@ -211,7 +217,7 @@ Measured on Snapdragon 8+ Gen 1 (ARM Cortex-X2 @ 3.2 GHz), Qwen2.5 0.5B Instruct
 - Single model in memory (no swapping)
 - Thread-per-request server (not async)
 - Only LLaMA-family architectures
-- No GPU acceleration
+- Vulkan backend: Adreno-only, Q8_0 only, batch matmul only
 
 ## License
 

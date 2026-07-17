@@ -892,6 +892,30 @@ int ct_tokenizer_decode(ct_tokenizer* tok, const int* tokens, int n_tokens,
 }
 
 /* ═══════════════════════════════════════════════════════════════
+ * ct_tokenizer_decode_single
+ * ═══════════════════════════════════════════════════════════════ */
+
+int ct_tokenizer_decode_single(ct_tokenizer* tok, int token,
+                                char* text, size_t text_size) {
+    if (!tok || !text || text_size == 0) return -1;
+    if (token < 0 || token >= tok->vocab_size) {
+        text[0] = '\0';
+        return 0;
+    }
+    int len = tok->token_lens[token];
+    if (len <= 0) {
+        text[0] = '\0';
+        return 0;
+    }
+    size_t copy = (size_t)len < text_size - 1 ? (size_t)len : text_size - 1;
+    memcpy(text, tok->tokens[token], copy);
+    text[copy] = '\0';
+    size_t pos = copy;
+    gpt2_decode_bytes(text, &pos);
+    return (int)pos;
+}
+
+/* ═══════════════════════════════════════════════════════════════
  * ct_tokenizer_free
  * ═══════════════════════════════════════════════════════════════ */
 

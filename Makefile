@@ -1,9 +1,11 @@
 # Calm — Universal Local LLM Runtime
 # Build: make <target>
 # Device: clang, aarch64 (ARMv8.2-a NEON+i8mm)
+# Optional: Vulkan compute backend (requires vulkan-headers + shaderc)
 
 CC = clang
 CFLAGS = -O2 -std=c11 -march=armv8.2-a+dotprod+i8mm+fp16 -DCT_NEON
+CFLAGS_VK = -DCT_VULKAN
 LDFLAGS = -lm -lpthread
 
 # Sources
@@ -15,6 +17,7 @@ TOKENIZER_SRC = calm_tokenizer.c
 SERVER_SRC = calm_server.c
 TOOLS_SRC = calm_tools.c
 MAIN_SRC = calm.c
+VK_SRC = calm_vulkan.c
 
 # Objects
 QUANT_OBJ = $(QUANT_SRC:.c=.o)
@@ -25,39 +28,58 @@ TOKENIZER_OBJ = $(TOKENIZER_SRC:.c=.o)
 SERVER_OBJ = $(SERVER_SRC:.c=.o)
 TOOLS_OBJ = $(TOOLS_SRC:.c=.o)
 MAIN_OBJ = $(MAIN_SRC:.c=.o)
+VK_OBJ = $(VK_SRC:.c=.o)
 
-.PHONY: all clean run serve
+CALM_OBJS = $(MAIN_OBJ) $(QUANT_OBJ) $(GGUF_OBJ) $(INFER_OBJ) \
+            $(TOKENIZER_OBJ) $(SERVER_OBJ) $(TOOLS_OBJ) $(VK_OBJ)
+
+# x86 AVX2 build (desktop/server)
+CFLAGS_X86 = -O2 -std=c11 -mavx2 -mfma -DCT_AVX2
+
+# SPIR-V shaders
+SHADER_DIR = shaders
+SHADER_SRC = $(SHADER_DIR)/q8_0_matmul.comp
+SHADER_SPV = $(SHADER_DIR)/q8_0_matmul.spv
+SHADER_HEADER = $(SHADER_DIR)/q8_0_matmul_spv.h
+
+.PHONY: all clean x86 shaders
 
 all: calm calm_convert
 
-calm: $(MAIN_OBJ) $(QUANT_OBJ) $(GGUF_OBJ) $(INFER_OBJ) $(TOKENIZER_OBJ) $(SERVER_OBJ) $(TOOLS_OBJ)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
-	@echo "Built: $@"
+# ---- SPIR-V shader compilation ----
+$(SHADER_SPV): $(SHADER_SRC)
+	glslangValidator -V -o $@ $<
 
+$(SHADER_HEADER): $(SHADER_SPV)
+	glslangValidator -V --variable-name q8_0_matmul_spv_data -o $@ $(SHADER_SRC)
+
+shaders: $(SHADER_HEADER)
+
+# ---- Main binary (ARM NEON) ----
+calm: $(SHADER_HEADER) $(CALM_OBJS)
+	$(CC) $(CFLAGS) -o $@ $(filter-out $(SHADER_HEADER),$^) $(LDFLAGS) -ldl
+	@echo "Built: $@ (ARM NEON + Vulkan)"
+
+# ---- Vulkan-enabled build (ARM NEON + Vulkan) ----
+calm-vk: $(SHADER_HEADER) $(CALM_OBJS) $(VK_OBJ)
+	$(CC) $(CFLAGS) -o $@ $(filter-out $(SHADER_HEADER),$^) $(LDFLAGS) -ldl
+	@echo "Built: $@ (ARM NEON + Vulkan)"
+
+# ---- x86 build ----
+x86: shaders
+	$(MAKE) calm CFLAGS="$(CFLAGS_X86)"
+	@echo "Built: calm (x86 AVX2)"
+
+# ---- Convert tool ----
 calm_convert: $(CONVERT_OBJ) $(GGUF_OBJ) $(QUANT_OBJ)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 	@echo "Built: $@"
 
+# ---- Compile rules ----
 .c.o:
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) -DCT_VULKAN -c $< -o $@
 
+# ---- Clean ----
 clean:
-	rm -f *.o calm calm_convert
-
-# Quick run (auto-detect GGUF)
-RUN_MODEL ?= $(wildcard *.gguf)
-run: calm
-	@if [ -z "$(RUN_MODEL)" ]; then \
-		echo "No .gguf found. Set RUN_MODEL=/path/to/model.gguf"; \
-		exit 1; \
-	fi
-	./calm run $(RUN_MODEL)
-
-# Quick serve (auto-detect GGUF)
-SERVE_PORT ?= 8080
-serve: calm
-	@if [ -z "$(RUN_MODEL)" ]; then \
-		echo "No .gguf found. Set RUN_MODEL=/path/to/model.gguf"; \
-		exit 1; \
-	fi
-	./calm serve $(RUN_MODEL) --port $(SERVE_PORT)
+	rm -f *.o calm calm_convert calm-vk
+	rm -f $(SHADER_SPV) $(SHADER_HEADER)

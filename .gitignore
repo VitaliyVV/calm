@@ -14,9 +14,12 @@
 .DS_Store
 Thumbs.db
 calm
+calm-vk
 calm_convert
 cortex
 cortex_convert
 test_quant
 test_tokenizer
 test_vec
+# Temp debugging files
+/tmp/

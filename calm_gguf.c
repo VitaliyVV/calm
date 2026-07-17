@@ -23,10 +23,12 @@
 
 static uint64_t read_key_len(const uint8_t* data, size_t offset, size_t size,
                               size_t* advance) {
-    uint32_t len32 = *(const uint32_t*)(data + offset);
+    uint32_t len32;
+    memcpy(&len32, data + offset, 4);
     /* Перед uint64 стоит uint32 с тем же значением, затем 4 нулевых байта */
     if (offset + 8 <= size) {
-        uint64_t full = *(const uint64_t*)(data + offset);
+        uint64_t full;
+        memcpy(&full, data + offset, 8);
         if ((full >> 32) == 0 && len32 > 0) {
             /* uint64 key length */
             *advance = 8;
@@ -311,25 +313,27 @@ ct_gguf_context* ct_gguf_open(const char* path) {
 
         /* n_dims (GGUF v3: uint32_t) */
         if (pos + 4 > file_size) goto fail;
-        uint32_t n_dims = *(const uint32_t*)(data + pos);
+        uint32_t n_dims;
+        memcpy(&n_dims, data + pos, 4);
         pos += 4;
 
         /* Dimensions (int64_t[n_dims] - come BEFORE type in GGUF v3!) */
         uint64_t dims[4] = {0};
         for (uint32_t d = 0; d < n_dims && d < 4; d++) {
             if (pos + 8 > file_size) goto fail;
-            dims[d] = *(const uint64_t*)(data + pos);
+            memcpy(&dims[d], data + pos, 8);
             pos += 8;
         }
 
         /* Type (ggml_type uint32_t - comes AFTER dims in GGUF v3) */
         if (pos + 4 > file_size) goto fail;
-        uint32_t type = *(const uint32_t*)(data + pos);
+        uint32_t type;
+        memcpy(&type, data + pos, 4);
         pos += 4;
-
         /* Offset from tensor data start */
         if (pos + 8 > file_size) goto fail;
-        size_t offset = (size_t)*(const uint64_t*)(data + pos);
+        size_t offset;
+        memcpy(&offset, data + pos, 8);
         pos += 8;
 
         if (i < ctx->tensor_count) {
