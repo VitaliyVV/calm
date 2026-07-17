@@ -11,6 +11,7 @@
  */
 #include "calm_infer.h"
 #include "calm_quant.h"
+#include "calm_ssm.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -468,6 +469,17 @@ static int extract_config(ct_gguf_context* gguf, ct_infer_config* cfg) {
     cfg->n_expert          = (int)meta_get(gguf, arch, "expert_count", 0);
     cfg->n_expert_per_token = (int)meta_get(gguf, arch, "expert_used_count", 0);
 
+    /* SSM (Mamba) config — defaults to 0 (not an SSM model) */
+    cfg->ssm_d_conv     = (int)meta_get(gguf, arch, "ssm.conv_kernel", 0);
+    cfg->ssm_d_inner    = (int)meta_get(gguf, arch, "ssm.inner_size", 0);
+    cfg->ssm_d_state    = (int)meta_get(gguf, arch, "ssm.state_size", 0);
+    cfg->ssm_dt_rank    = (int)meta_get(gguf, arch, "ssm.time_step_rank", 0);
+    cfg->ssm_dt_b_c_rms = (int)meta_get(gguf, arch, "ssm.dt_b_c_rms", 0);
+
+    /* If ssm_d_inner not stored, default to 2 * n_embd (Mamba convention) */
+    if (cfg->ssm_d_conv > 0 && cfg->ssm_d_inner == 0)
+        cfg->ssm_d_inner = 2 * cfg->n_embd;
+
     /* If head_dim not explicitly stored, infer from n_embd / n_head */
     if (cfg->head_dim == 0 && cfg->n_head > 0)
         cfg->head_dim = cfg->n_embd / cfg->n_head;
@@ -540,6 +552,11 @@ static int build_weights(ct_gguf_context* gguf, ct_infer_weights* w) {
         char name[128];
         int tmp_type;
 
+        /* Detect layer type: check for SSM vs Attention */
+        snprintf(name, sizeof(name), "blk.%d.ssm_in.weight", i);
+        l->is_ssm = (find_tensor(gguf, name, &tmp_type) != NULL) ? 1 : 0;
+
+        /* Load attn_norm (used by both attention and SSM blocks) */
         snprintf(name, sizeof(name), "blk.%d.attn_norm.weight", i);
         l->attn_norm = (float*)find_tensor(gguf, name, &tmp_type);
         if (i == 0) fprintf(stderr, "infer: attn_norm type=%d (layer 0)\n", tmp_type);
@@ -548,45 +565,105 @@ static int build_weights(ct_gguf_context* gguf, ct_infer_weights* w) {
             return -1;
         }
 
-        snprintf(name, sizeof(name), "blk.%d.attn_q.weight", i);
-        l->attn_q = (void*)find_tensor(gguf, name, &l->t_q);
-        if (!l->attn_q) {
-            fprintf(stderr, "infer: missing blk.%d.attn_q.weight\n", i);
-            return -1;
-        }
-        if (i == 0) fprintf(stderr, "infer: blk.0.attn_q.weight type=%d\n", l->t_q);
-        /* QKV bias — optional (Qwen2 uses them, LLaMA doesn't) */
-        snprintf(name, sizeof(name), "blk.%d.attn_q.bias", i);
-        l->attn_q_bias = (float*)find_tensor(gguf, name, &tmp_type);
-        if (i == 0 && l->attn_q_bias) fprintf(stderr, "infer: attn_q.bias type=%d (layer 0)\n", tmp_type);
+        if (l->is_ssm) {
+            /* ── SSM (Mamba) layer — no attention weights ── */
+            if (i == 0) fprintf(stderr, "infer: blk.0 is SSM layer (ssm_in)\n");
 
-        snprintf(name, sizeof(name), "blk.%d.attn_k.weight", i);
-        l->attn_k = (void*)find_tensor(gguf, name, &l->t_k);
-        if (!l->attn_k) {
-            fprintf(stderr, "infer: missing blk.%d.attn_k.weight\n", i);
-            return -1;
-        }
-        if (i == 0) fprintf(stderr, "infer: blk.0.attn_k.weight type=%d\n", l->t_k);
-        snprintf(name, sizeof(name), "blk.%d.attn_k.bias", i);
-        l->attn_k_bias = (float*)find_tensor(gguf, name, &tmp_type);
+            snprintf(name, sizeof(name), "blk.%d.ssm_in.weight", i);
+            l->ssm_in = (void*)find_tensor(gguf, name, &l->t_ssm_in);
+            if (!l->ssm_in) { fprintf(stderr, "infer: missing %s\n", name); return -1; }
 
-        snprintf(name, sizeof(name), "blk.%d.attn_v.weight", i);
-        l->attn_v = (void*)find_tensor(gguf, name, &l->t_v);
-        if (!l->attn_v) {
-            fprintf(stderr, "infer: missing blk.%d.attn_v.weight\n", i);
-            return -1;
-        }
-        if (i == 0) fprintf(stderr, "infer: blk.0.attn_v.weight type=%d\n", l->t_v);
-        snprintf(name, sizeof(name), "blk.%d.attn_v.bias", i);
-        l->attn_v_bias = (float*)find_tensor(gguf, name, &tmp_type);
+            snprintf(name, sizeof(name), "blk.%d.ssm_conv1d.weight", i);
+            l->ssm_conv1d = (void*)find_tensor(gguf, name, &l->t_ssm_conv1d);
+            if (!l->ssm_conv1d) { fprintf(stderr, "infer: missing %s\n", name); return -1; }
 
-        snprintf(name, sizeof(name), "blk.%d.attn_output.weight", i);
-        l->attn_out = (void*)find_tensor(gguf, name, &l->t_o);
-        if (!l->attn_out) {
-            fprintf(stderr, "infer: missing blk.%d.attn_output.weight\n", i);
-            return -1;
+            snprintf(name, sizeof(name), "blk.%d.ssm_conv1d.bias", i);
+            l->ssm_conv1d_b = (float*)find_tensor(gguf, name, &tmp_type);
+
+            snprintf(name, sizeof(name), "blk.%d.ssm_x.weight", i);
+            l->ssm_x = (void*)find_tensor(gguf, name, &l->t_ssm_x);
+            if (!l->ssm_x) { fprintf(stderr, "infer: missing %s\n", name); return -1; }
+
+            /* Optional RMS norm weights for dt, B, C (Jamba-style) */
+            snprintf(name, sizeof(name), "blk.%d.ssm_dt_norm.weight", i);
+            l->ssm_dt_norm = (float*)find_tensor(gguf, name, &tmp_type);
+            snprintf(name, sizeof(name), "blk.%d.ssm_b_norm.weight", i);
+            l->ssm_b_norm = (float*)find_tensor(gguf, name, &tmp_type);
+            snprintf(name, sizeof(name), "blk.%d.ssm_c_norm.weight", i);
+            l->ssm_c_norm = (float*)find_tensor(gguf, name, &tmp_type);
+
+            snprintf(name, sizeof(name), "blk.%d.ssm_dt.weight", i);
+            l->ssm_dt = (void*)find_tensor(gguf, name, &l->t_ssm_dt);
+            if (!l->ssm_dt) { fprintf(stderr, "infer: missing %s\n", name); return -1; }
+
+            snprintf(name, sizeof(name), "blk.%d.ssm_dt.bias", i);
+            l->ssm_dt_b = (float*)find_tensor(gguf, name, &tmp_type);
+
+            snprintf(name, sizeof(name), "blk.%d.ssm_a", i);
+            l->ssm_a = (void*)find_tensor(gguf, name, &l->t_ssm_a);
+            if (!l->ssm_a) { fprintf(stderr, "infer: missing %s\n", name); return -1; }
+
+            snprintf(name, sizeof(name), "blk.%d.ssm_d", i);
+            l->ssm_d = (void*)find_tensor(gguf, name, &l->t_ssm_d);
+            if (!l->ssm_d) { fprintf(stderr, "infer: missing %s\n", name); return -1; }
+
+            snprintf(name, sizeof(name), "blk.%d.ssm_out.weight", i);
+            l->ssm_out = (void*)find_tensor(gguf, name, &l->t_ssm_out);
+            if (!l->ssm_out) { fprintf(stderr, "infer: missing %s\n", name); return -1; }
+
+            /* Zero out attention pointers (safety) */
+            l->attn_q = l->attn_k = l->attn_v = NULL;
+            l->attn_out = NULL;
+            l->attn_q_bias = l->attn_k_bias = l->attn_v_bias = NULL;
+
+            /* Print SSM layer summary once */
+            if (i == 0) {
+                fprintf(stderr, "infer: ssm_in type=%d, ssm_conv1d type=%d, ssm_x type=%d, "
+                        "ssm_dt type=%d, ssm_a type=%d, ssm_d type=%d, ssm_out type=%d\n",
+                        l->t_ssm_in, l->t_ssm_conv1d, l->t_ssm_x,
+                        l->t_ssm_dt, l->t_ssm_a, l->t_ssm_d, l->t_ssm_out);
+            }
+        } else {
+            /* ── Attention layer (original path) ── */
+            snprintf(name, sizeof(name), "blk.%d.attn_q.weight", i);
+            l->attn_q = (void*)find_tensor(gguf, name, &l->t_q);
+            if (!l->attn_q) {
+                fprintf(stderr, "infer: missing blk.%d.attn_q.weight\n", i);
+                return -1;
+            }
+            if (i == 0) fprintf(stderr, "infer: blk.0.attn_q.weight type=%d\n", l->t_q);
+            snprintf(name, sizeof(name), "blk.%d.attn_q.bias", i);
+            l->attn_q_bias = (float*)find_tensor(gguf, name, &tmp_type);
+            if (i == 0 && l->attn_q_bias) fprintf(stderr, "infer: attn_q.bias type=%d (layer 0)\n", tmp_type);
+
+            snprintf(name, sizeof(name), "blk.%d.attn_k.weight", i);
+            l->attn_k = (void*)find_tensor(gguf, name, &l->t_k);
+            if (!l->attn_k) {
+                fprintf(stderr, "infer: missing blk.%d.attn_k.weight\n", i);
+                return -1;
+            }
+            if (i == 0) fprintf(stderr, "infer: blk.0.attn_k.weight type=%d\n", l->t_k);
+            snprintf(name, sizeof(name), "blk.%d.attn_k.bias", i);
+            l->attn_k_bias = (float*)find_tensor(gguf, name, &tmp_type);
+
+            snprintf(name, sizeof(name), "blk.%d.attn_v.weight", i);
+            l->attn_v = (void*)find_tensor(gguf, name, &l->t_v);
+            if (!l->attn_v) {
+                fprintf(stderr, "infer: missing blk.%d.attn_v.weight\n", i);
+                return -1;
+            }
+            if (i == 0) fprintf(stderr, "infer: blk.0.attn_v.weight type=%d\n", l->t_v);
+            snprintf(name, sizeof(name), "blk.%d.attn_v.bias", i);
+            l->attn_v_bias = (float*)find_tensor(gguf, name, &tmp_type);
+
+            snprintf(name, sizeof(name), "blk.%d.attn_output.weight", i);
+            l->attn_out = (void*)find_tensor(gguf, name, &l->t_o);
+            if (!l->attn_out) {
+                fprintf(stderr, "infer: missing blk.%d.attn_output.weight\n", i);
+                return -1;
+            }
+            if (i == 0) fprintf(stderr, "infer: blk.0.attn_output.weight type=%d\n", l->t_o);
         }
-        if (i == 0) fprintf(stderr, "infer: blk.0.attn_output.weight type=%d\n", l->t_o);
 
         snprintf(name, sizeof(name), "blk.%d.ffn_norm.weight", i);
         l->ffn_norm = (float*)find_tensor(gguf, name, &tmp_type);
@@ -825,6 +902,8 @@ ct_infer_state* ct_infer_create(ct_gguf_context* gguf, int max_ctx, int gpu_laye
     /* Working buffers — allocate to max needed size across all uses */
     int buf_k_size = cfg->n_ff > cfg->n_embd ? cfg->n_ff : cfg->n_embd;
     if (nhkv * hd > buf_k_size) buf_k_size = nhkv * hd;
+    /* SSM d_inner may exceed n_ff, ensure buffer is large enough */
+    if (cfg->ssm_d_inner > buf_k_size) buf_k_size = cfg->ssm_d_inner;
     s->hidden  = (float*)calloc((size_t)cfg->n_embd, sizeof(float));
     s->normed  = (float*)calloc((size_t)cfg->n_embd, sizeof(float));
     s->buf_q   = (float*)calloc((size_t)cfg->n_embd, sizeof(float));
@@ -838,6 +917,28 @@ ct_infer_state* ct_infer_create(ct_gguf_context* gguf, int max_ctx, int gpu_laye
     if (!s->k_cache || !s->v_cache || !s->hidden || !s->normed || !s->buf_q ||
         !s->buf_k || !s->buf_v || !s->scores || !s->ffbuf || !s->logits)
         goto fail;
+
+    /* SSM state caches (only for SSM models) */
+    s->ssm_conv_state   = NULL;
+    s->ssm_hidden_state = NULL;
+    if (cfg->ssm_d_conv > 0 && cfg->ssm_d_inner > 0 && cfg->ssm_d_state > 0) {
+        int d_conv  = cfg->ssm_d_conv;
+        int d_inner = cfg->ssm_d_inner;
+        int d_state = cfg->ssm_d_state;
+        size_t conv_sz = (size_t)cfg->n_layer * d_inner * (d_conv > 0 ? d_conv - 1 : 0);
+        size_t hid_sz  = (size_t)cfg->n_layer * d_state * d_inner;
+
+        if (conv_sz > 0) {
+            s->ssm_conv_state = (float*)calloc(conv_sz, sizeof(float));
+            if (!s->ssm_conv_state) goto fail;
+        }
+        if (hid_sz > 0) {
+            s->ssm_hidden_state = (float*)calloc(hid_sz, sizeof(float));
+            if (!s->ssm_hidden_state) goto fail;
+        }
+        fprintf(stderr, "infer: SSM caches allocated (conv=%zu els, state=%zu els)\n",
+                conv_sz, hid_sz);
+    }
 
     return s;
 
@@ -874,105 +975,135 @@ int ct_infer_forward(ct_infer_state* s, int pos,
     for (int layer = 0; layer < L; layer++) {
         ct_infer_layer* lw = &s->w.layers[layer];
 
-        /* ── Attention sub-block ── */
+        /* ── SSM / Attention sub-block ── */
 
-        /* RMS norm (s->normed is dedicated — no aliasing with bufs) */
-        rms_norm(s->normed, h, lw->attn_norm, E, cfg->norm_rms_eps);
-
-        /* Batch: Q, K, V all from the same normed input (skip Vulkan for layers beyond gpu_layers) */
+        /* Vulkan flag for batching (used in attention + FFN sections) */
         int use_vk = 0;
-#ifdef CT_VULKAN
-        use_vk = (g_vk && layer < s->gpu_layers);
-        if (use_vk) ct_vulkan_batch_begin(g_vk);
-#endif
-        __asm__ volatile("" ::: "memory");
-        matmul(s->buf_q, s->normed, lw->attn_q, lw->t_q, E, H * HD);
-        __asm__ volatile("" ::: "memory");
-        matmul(s->buf_k, s->normed, lw->attn_k, lw->t_k, E, HK * HD);
-        __asm__ volatile("" ::: "memory");
-        matmul(s->buf_v, s->normed, lw->attn_v, lw->t_v, E, HK * HD);
-#ifdef CT_VULKAN
-        if (use_vk) ct_vulkan_batch_end(g_vk);
-#endif
-        /* Add QKV biases if present (Qwen2 uses them, LLaMA doesn't) */
-        if (lw->attn_q_bias)
-            for (int j = 0; j < H * HD; j++) s->buf_q[j] += lw->attn_q_bias[j];
-        if (lw->attn_k_bias)
-            for (int j = 0; j < HK * HD; j++) s->buf_k[j] += lw->attn_k_bias[j];
-        if (lw->attn_v_bias)
-            for (int j = 0; j < HK * HD; j++) s->buf_v[j] += lw->attn_v_bias[j];
-        /* Apply RoPE to Q (once per head) */
-        for (int hh = 0; hh < H; hh++)
-            rope(s->buf_q + hh * HD, HD, pos, cfg->rope_freq_base);
-        /* Apply RoPE to K (once per KV head) */
-        for (int hh = 0; hh < HK; hh++)
-            rope(s->buf_k + hh * HD, HD, pos, cfg->rope_freq_base);
 
-        /* ── Store K, V into KV cache ── */
-        /* Layout: cache[layer][head][pos][dim] — contiguous within (head, pos) */
-        size_t layer_stride = (size_t)HK * HD * s->max_ctx;
-        float* layer_k = s->k_cache + layer * layer_stride;
-        float* layer_v = s->v_cache + layer * layer_stride;
+        if (lw->is_ssm) {
+            /* ── SSM (Mamba) forward pass ── */
+            /* Get per-layer SSM state caches */
+            int d_inner = cfg->ssm_d_inner;
+            int d_conv  = cfg->ssm_d_conv;
+            int d_state = cfg->ssm_d_state;
+            int c_stride = d_conv > 1 ? d_conv - 1 : 1;
 
-        for (int hh = 0; hh < HK; hh++) {
-            float* k_dst = layer_k + (size_t)hh * HD * s->max_ctx + (size_t)pos * HD;
-            float* v_dst = layer_v + (size_t)hh * HD * s->max_ctx + (size_t)pos * HD;
-            memcpy(k_dst, s->buf_k + hh * HD, (size_t)HD * sizeof(float));
-            memcpy(v_dst, s->buf_v + hh * HD, (size_t)HD * sizeof(float));
+            float* conv_state = s->ssm_conv_state
+                ? s->ssm_conv_state + (size_t)layer * d_inner * c_stride
+                : NULL;
+            float* hid_state  = s->ssm_hidden_state
+                ? s->ssm_hidden_state + (size_t)layer * d_state * d_inner
+                : NULL;
+
+            /* RMS norm (same norm used by SSM block as input normalization) */
+            rms_norm(s->normed, h, lw->attn_norm, E, cfg->norm_rms_eps);
+
+            /* SSM forward: normed → ssm_block → residual */
+            ct_forward_ssm(s->ffbuf, s->normed, lw, cfg,
+                          conv_state, hid_state);
+            for (int i = 0; i < E; i++)
+                h[i] += s->ffbuf[i];
+
+        } else {
+            /* ── Attention sub-block ── */
+
+            /* RMS norm (s->normed is dedicated — no aliasing with bufs) */
+            rms_norm(s->normed, h, lw->attn_norm, E, cfg->norm_rms_eps);
+
+            /* Batch: Q, K, V all from the same normed input (skip Vulkan for layers beyond gpu_layers) */
+#ifdef CT_VULKAN
+            use_vk = (g_vk && layer < s->gpu_layers);
+            if (use_vk) ct_vulkan_batch_begin(g_vk);
+#endif
+            __asm__ volatile("" ::: "memory");
+            matmul(s->buf_q, s->normed, lw->attn_q, lw->t_q, E, H * HD);
+            __asm__ volatile("" ::: "memory");
+            matmul(s->buf_k, s->normed, lw->attn_k, lw->t_k, E, HK * HD);
+            __asm__ volatile("" ::: "memory");
+            matmul(s->buf_v, s->normed, lw->attn_v, lw->t_v, E, HK * HD);
+#ifdef CT_VULKAN
+            if (use_vk) ct_vulkan_batch_end(g_vk);
+#endif
+            /* Add QKV biases if present (Qwen2 uses them, LLaMA doesn't) */
+            if (lw->attn_q_bias)
+                for (int j = 0; j < H * HD; j++) s->buf_q[j] += lw->attn_q_bias[j];
+            if (lw->attn_k_bias)
+                for (int j = 0; j < HK * HD; j++) s->buf_k[j] += lw->attn_k_bias[j];
+            if (lw->attn_v_bias)
+                for (int j = 0; j < HK * HD; j++) s->buf_v[j] += lw->attn_v_bias[j];
+            /* Apply RoPE to Q (once per head) */
+            for (int hh = 0; hh < H; hh++)
+                rope(s->buf_q + hh * HD, HD, pos, cfg->rope_freq_base);
+            /* Apply RoPE to K (once per KV head) */
+            for (int hh = 0; hh < HK; hh++)
+                rope(s->buf_k + hh * HD, HD, pos, cfg->rope_freq_base);
+
+            /* ── Store K, V into KV cache ── */
+            /* Layout: cache[layer][head][pos][dim] — contiguous within (head, pos) */
+            size_t layer_stride = (size_t)HK * HD * s->max_ctx;
+            float* layer_k = s->k_cache + layer * layer_stride;
+            float* layer_v = s->v_cache + layer * layer_stride;
+
+            for (int hh = 0; hh < HK; hh++) {
+                float* k_dst = layer_k + (size_t)hh * HD * s->max_ctx + (size_t)pos * HD;
+                float* v_dst = layer_v + (size_t)hh * HD * s->max_ctx + (size_t)pos * HD;
+                memcpy(k_dst, s->buf_k + hh * HD, (size_t)HD * sizeof(float));
+                memcpy(v_dst, s->buf_v + hh * HD, (size_t)HD * sizeof(float));
+            }
+
+            /* ── Attention ── */
+            /* attn_out overwrites buf_q (Q consumed per-head, then overwritten) */
+            float* attn_out = s->buf_q;
+            for (int hh = 0; hh < H; hh++) {
+                int kg = hh / n_groups;        /* shared KV head index */
+                float* Qh = s->buf_q + hh * HD;
+                float* Kh = layer_k + (size_t)kg * HD * s->max_ctx;
+                float* Vh = layer_v + (size_t)kg * HD * s->max_ctx;
+                float* out_h = attn_out + hh * HD;
+
+                /* Scores: score[p] = Qh·Kh[p] / sqrt(HD) */
+                float max_score = -1e38f;
+                for (int p = 0; p <= pos; p++) {
+                    float* Kp = Kh + (size_t)p * HD;
+                    float dot = 0.0f;
+                    for (int d = 0; d < HD; d++)
+                        dot += Qh[d] * Kp[d];
+                    s->scores[p] = dot * rcp_sqrt_hd;
+                    if (s->scores[p] > max_score) max_score = s->scores[p];
+                }
+
+                /* Softmax */
+                float sum_exp = 0.0f;
+                for (int p = 0; p <= pos; p++) {
+                    s->scores[p] = expf(s->scores[p] - max_score);
+                    sum_exp += s->scores[p];
+                }
+                float rcp_sum = 1.0f / (sum_exp + 1e-10f);
+                for (int p = 0; p <= pos; p++)
+                    s->scores[p] *= rcp_sum;
+
+                /* Weighted sum: out_h += softmax[p] * Vh[p] */
+                memset(out_h, 0, (size_t)HD * sizeof(float));
+                for (int p = 0; p <= pos; p++) {
+                    float sp = s->scores[p];
+                    float* Vp = Vh + (size_t)p * HD;
+                    for (int d = 0; d < HD; d++)
+                        out_h[d] += sp * Vp[d];
+                }
+            }
+
+            /* Attention output projection: attn_residual[E] = attn_out[H*HD] @ Wo[H*HD, E] */
+            /* Reuse ffbuf for attn_residual (it's [n_ff] >= [n_embd]) */
+#ifdef CT_VULKAN
+            if (g_vk) ct_vulkan_batch_begin(g_vk);
+#endif
+            matmul(s->ffbuf, attn_out, lw->attn_out, lw->t_o, H * HD, E);
+#ifdef CT_VULKAN
+            if (g_vk) ct_vulkan_batch_end(g_vk);
+#endif
+            for (int i = 0; i < E; i++)
+                h[i] += s->ffbuf[i];
         }
-
-        /* ── Attention ── */
-        /* attn_out overwrites buf_q (Q consumed per-head, then overwritten) */
-        float* attn_out = s->buf_q;
-        for (int hh = 0; hh < H; hh++) {
-            int kg = hh / n_groups;        /* shared KV head index */
-            float* Qh = s->buf_q + hh * HD;
-            float* Kh = layer_k + (size_t)kg * HD * s->max_ctx;
-            float* Vh = layer_v + (size_t)kg * HD * s->max_ctx;
-            float* out_h = attn_out + hh * HD;
-
-            /* Scores: score[p] = Qh·Kh[p] / sqrt(HD) */
-            float max_score = -1e38f;
-            for (int p = 0; p <= pos; p++) {
-                float* Kp = Kh + (size_t)p * HD;
-                float dot = 0.0f;
-                for (int d = 0; d < HD; d++)
-                    dot += Qh[d] * Kp[d];
-                s->scores[p] = dot * rcp_sqrt_hd;
-                if (s->scores[p] > max_score) max_score = s->scores[p];
-            }
-
-            /* Softmax */
-            float sum_exp = 0.0f;
-            for (int p = 0; p <= pos; p++) {
-                s->scores[p] = expf(s->scores[p] - max_score);
-                sum_exp += s->scores[p];
-            }
-            float rcp_sum = 1.0f / (sum_exp + 1e-10f);
-            for (int p = 0; p <= pos; p++)
-                s->scores[p] *= rcp_sum;
-
-            /* Weighted sum: out_h += softmax[p] * Vh[p] */
-            memset(out_h, 0, (size_t)HD * sizeof(float));
-            for (int p = 0; p <= pos; p++) {
-                float sp = s->scores[p];
-                float* Vp = Vh + (size_t)p * HD;
-                for (int d = 0; d < HD; d++)
-                    out_h[d] += sp * Vp[d];
-            }
-        }
-
-        /* Attention output projection: attn_residual[E] = attn_out[H*HD] @ Wo[H*HD, E] */
-        /* Reuse ffbuf for attn_residual (it's [n_ff] >= [n_embd]) */
-#ifdef CT_VULKAN
-        if (g_vk) ct_vulkan_batch_begin(g_vk);
-#endif
-        matmul(s->ffbuf, attn_out, lw->attn_out, lw->t_o, H * HD, E);
-#ifdef CT_VULKAN
-        if (g_vk) ct_vulkan_batch_end(g_vk);
-#endif
-        for (int i = 0; i < E; i++)
-            h[i] += s->ffbuf[i];
 
         /* ── FFN sub-block ── */
 
@@ -1305,6 +1436,8 @@ void ct_infer_free(ct_infer_state* s) {
     free(s->w.layers);
     free(s->k_cache);
     free(s->v_cache);
+    free(s->ssm_conv_state);
+    free(s->ssm_hidden_state);
     free(s->hidden);
     free(s->normed);
     free(s->buf_q);

@@ -380,7 +380,7 @@ total params: ~15.7B
 9. ✅ **BQ1_0/TQ1_0 quant ядра** — с NEON оптимизацией
 10. ✅ **GGUF→TQ1_0/BQ1_0 конвертер** — `calm_convert.c`
 11. ◐ **Phase 6: GGUF→GGUF Requantizer** — streaming core ✅, dequant F32/F16/Q8_0/Q4_0/Q4_1/Q5_0/Q5_1/Q2_K/Q4_K/Q5_K/Q6_K ✅, остались IQ форматы
-12. 🔄 **Phase 7: SSM Forward Pass** — Mamba-style selective scan для Qwen3.5/Jamba/Ornith гибридов
+12. ✅ **Phase 7: SSM Forward Pass** — Mamba-style selective scan для Qwen3.5/Jamba/Ornith гибридов
 13. 🔄 **Phase 8: DeepSeek2 (MLA+MoE)** — Multi-head Latent Attention + DeepSeekMoE для DeepSeek-Coder-V2
 14. 📦 **mmap/expert streaming** — Colibri-style, холодные эксперты с диска
 15. 📦 **Qwen3.6 архитектура** — для запуска Bonsai-27B (1-bit, 3.9 GB) — зависит от Phase 7
@@ -399,7 +399,7 @@ Phase 1: C engine base        ✅      ✅       ✅       ✅          ✅     
 Phase 2: BQ1_0/TQ1_0 quant    ✅      ✅       ✅       ✅          ✅       ✅
 Phase 4: Auto-config          ✅      ✅       ✅       ✅          ✅       ✅
 Phase 6: Requantizer          ✅      ✅       ✅       ✅          ✅       ✅
-Phase 7: SSM Forward          🔜      🔜       🔜       —           🔜       🔜
+Phase 7: SSM Forward          ✅      ✅       ✅       —           ✅       ✅
 Phase 8: MLA + DeepSeekMoE    —       —        —        🔜          —        —
 Доп: Qwen3.6 arch             —       —        —        —           🔜       🔜
 ```
@@ -556,6 +556,54 @@ Phase 6 (Requantizer) ───→ Phase 7 (SSM) ───→ Phase 8 (MLA/DeepS
 - **llama.cpp** — https://github.com/ggml-org/llama.cpp (GGUF reference, Vulkan backend)
 
 ---
+
+---
+
+## 🚀 Phase 7: SSM Forward Pass — Mamba1 для гибридных моделей (17 июля 2026)
+
+Реализован полный SSM (Mamba1) forward pass для token-by-token инференса гибридных
+Transformer+SSM архитектур (Jamba, Ornith, Qwythos, Qwen3.5 SSM).
+
+**Новые файлы:**
+- `calm_ssm.h` — структуры SSM-слоя, декларации функций
+- `calm_ssm.c` — реализации: `ct_ssm_conv1d()`, `ct_ssm_selective_scan()`, `ct_forward_ssm()`
+
+**Изменённые файлы:**
+- `calm_infer.h` — SSM конфиг в `ct_infer_config`, SSM weight pointers + `is_ssm` в `ct_infer_layer`,
+  SSM state caches в `ct_infer_state`
+- `calm_infer.c` — SSM metadata extraction в `extract_config()`, SSM tensor loading в `build_weights()`,
+  SSM dispatch (`is_ssm ? ssm_path : attention_path`) в `ct_infer_forward()`,
+  SSM cache alloc/free в `ct_infer_create()`/`ct_infer_free()`
+- `Makefile` — добавлен `calm_ssm.o`
+
+**SSM block pipeline (llama.cpp `build_mamba_layer()` equivalent):**
+1. `ssm_in` — input projection + output gate split
+2. `ssm_conv1d` — depthwise 1D convolution + bias + SiLU
+3. `ssm_x` — dt/B/C projection
+4. `ssm_dt_norm`/`ssm_b_norm`/`ssm_c_norm` — RMS norm (Jamba-style)
+5. `ssm_dt` — discretization time step projection
+6. `ssm_a` + `ssm_d` — selective scan + skip connection
+7. `silu(z)*y` — output gating
+8. `ssm_out` — output projection
+
+**Supported GGUF tensor names:** `blk.N.ssm_in.weight`, `blk.N.ssm_conv1d.weight`,
+`blk.N.ssm_x.weight`, `blk.N.ssm_dt.weight`, `blk.N.ssm_dt_norm.weight`,
+`blk.N.ssm_b_norm.weight`, `blk.N.ssm_c_norm.weight`, `blk.N.ssm_a`,
+`blk.N.ssm_d`, `blk.N.ssm_out.weight`
+
+**GGUF metadata keys:** `{arch}.ssm.conv_kernel`, `ssm.inner_size`, `ssm.state_size`,
+`ssm.time_step_rank`, `ssm.dt_b_c_rms`
+
+**Детекция гибридных слоёв:** каждый слой проверяется на наличие `blk.N.ssm_in.weight` —
+если найден, загружаются SSM веса и устанавливается `is_ssm=1`. Attention-слои
+загружаются как обычно. Диспетчер в `ct_infer_forward()` выбирает путь выполнения
+по флагу `is_ssm`.
+
+**Дальнейшие шаги:**
+- Тестирование на реальной SSM модели (Qwythos-9B TQ1_0) после конвертации
+- NEON-оптимизация selective scan (особенно expf-вызовы в цикле)
+- Поддержка Mamba2 (SSM с группировкой)
+- Опциональный GPU/Vulkan SSM kernel
 
 ## 🐛 Исправленные баги (17 июля 2026)
 

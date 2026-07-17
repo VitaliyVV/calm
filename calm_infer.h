@@ -36,10 +36,20 @@ typedef struct {
     int   n_expert_per_token; /* top-k experts per token (e.g. 2)   */
     float norm_rms_eps;
     float rope_freq_base;
+    /* ── SSM (Mamba) config (0 = not an SSM model) ── */
+    int   ssm_d_conv;         /* ssm.conv_kernel (e.g. 4)          */
+    int   ssm_d_inner;        /* ssm.inner_size (typically 2*n_embd) */
+    int   ssm_d_state;        /* ssm.state_size (e.g. 16)          */
+    int   ssm_dt_rank;        /* ssm.time_step_rank (e.g. 256)     */
+    int   ssm_dt_b_c_rms;     /* ssm.dt_b_c_rms (Jamba-style norm) */
 } ct_infer_config;
 
 /* ─── Per-layer weight pointers into mmap ─── */
 typedef struct {
+    /* Layer type: 0 = attention, 1 = SSM (Mamba) */
+    int is_ssm;
+
+    /* ── Attention weights (used when is_ssm == 0) ── */
     float* attn_norm;          /* F32 — norm weights always float */
     void*  attn_q;    int t_q;
     float* attn_q_bias;        /* Q bias (F32), may be NULL */
@@ -48,6 +58,22 @@ typedef struct {
     void*  attn_v;    int t_v;
     float* attn_v_bias;        /* V bias (F32), may be NULL */
     void*  attn_out;  int t_o;
+
+    /* ── SSM weights (used when is_ssm == 1) ── */
+    void*  ssm_in;      int t_ssm_in;       /* [n_embd, 2*d_inner]     */
+    void*  ssm_conv1d;  int t_ssm_conv1d;   /* [d_conv, d_inner]       */
+    float* ssm_conv1d_b;                    /* [d_inner] bias          */
+    void*  ssm_x;       int t_ssm_x;        /* [d_inner, dt_rank+2*d_state] */
+    float* ssm_dt_norm;                     /* [dt_rank] optional norm */
+    float* ssm_b_norm;                      /* [d_state] optional norm */
+    float* ssm_c_norm;                      /* [d_state] optional norm */
+    void*  ssm_dt;      int t_ssm_dt;       /* [dt_rank, d_inner] + bias */
+    float* ssm_dt_b;                        /* [d_inner] bias          */
+    void*  ssm_a;       int t_ssm_a;        /* [d_state, d_inner]      */
+    void*  ssm_d;       int t_ssm_d;        /* [d_inner]               */
+    void*  ssm_out;     int t_ssm_out;      /* [d_inner, n_embd]       */
+
+    /* ── FFN weights (shared by both layer types) ── */
     float* ffn_norm;
     void*  ffn_gate;  int t_g;  /* dense: SwiGLU gate; MoE: router weights */
     void*  ffn_up;    int t_u;
@@ -83,6 +109,9 @@ typedef struct {
     float* scores;   /* [max_ctx]     — attention scores        */
     float* ffbuf;    /* [n_ff]        — SiLU(gate) * up / res   */
     float* logits;   /* [n_vocab]     — output logits           */
+    /* ── SSM (Mamba) per-layer state caches (NULL for non-SSM models) ── */
+    float* ssm_conv_state;   /* [n_layer][d_inner][d_conv-1]   */
+    float* ssm_hidden_state; /* [n_layer][d_state][d_inner]    */
     int gpu_layers;   /* layers offloaded to GPU (0 = CPU only, 99 = all) */
     void* vk_backend; /* ct_vulkan_backend*, optional GPU offload */
 } ct_infer_state;

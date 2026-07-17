@@ -13,6 +13,7 @@ QUANT_SRC = calm_quant.c
 GGUF_SRC = calm_gguf.c
 CONVERT_SRC = calm_convert.c
 INFER_SRC = calm_infer.c
+SSM_SRC = calm_ssm.c
 TOKENIZER_SRC = calm_tokenizer.c
 SERVER_SRC = calm_server.c
 TOOLS_SRC = calm_tools.c
@@ -24,6 +25,7 @@ QUANT_OBJ = $(QUANT_SRC:.c=.o)
 GGUF_OBJ = $(GGUF_SRC:.c=.o)
 CONVERT_OBJ = $(CONVERT_SRC:.c=.o)
 INFER_OBJ = $(INFER_SRC:.c=.o)
+SSM_OBJ = $(SSM_SRC:.c=.o)
 TOKENIZER_OBJ = $(TOKENIZER_SRC:.c=.o)
 SERVER_OBJ = $(SERVER_SRC:.c=.o)
 TOOLS_OBJ = $(TOOLS_SRC:.c=.o)
@@ -31,7 +33,7 @@ MAIN_OBJ = $(MAIN_SRC:.c=.o)
 VK_OBJ = $(VK_SRC:.c=.o)
 
 CALM_OBJS = $(MAIN_OBJ) $(QUANT_OBJ) $(GGUF_OBJ) $(INFER_OBJ) \
-            $(TOKENIZER_OBJ) $(SERVER_OBJ) $(TOOLS_OBJ) $(VK_OBJ)
+            $(SSM_OBJ) $(TOKENIZER_OBJ) $(SERVER_OBJ) $(TOOLS_OBJ) $(VK_OBJ)
 
 # x86 AVX2 build (desktop/server)
 CFLAGS_X86 = -O2 -std=c11 -mavx2 -mfma -DCT_AVX2
