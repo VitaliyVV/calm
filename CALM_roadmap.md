@@ -42,46 +42,36 @@ calm estimate model.gguf   # прогноз скорости
 
 ---
 
-## Фаза 1: Нативный C-движок
+**Фаза 1: Нативный C-движок (v0.2 — завершена)**
 
 **Цель:** Собственный inference engine на чистом C, без внешних зависимостей.
 
 ### Компоненты
-- [ ] `calm.h` / `calm.c` — публичный C API
-- [ ] GGUF загрузчик (v3)
-- [ ] Поддержка MoE архитектур (router, expert dispatch)
-- [ ] Поддержка dense архитектур (Llama, Qwen, Mistral)
-- [ ] CPU бэкенд: ARM NEON, x86 AVX2/AVX512
-- [ ] Базовые форматы квантизации: Q4_0, Q4_K_M, Q8_0
+- [x] `calm.h` / `calm.c` — публичный C API
+- [x] GGUF загрузчик (v3)
+- [x] Поддержка dense архитектур (Llama, Qwen, Mistral)
+- [x] CPU бэкенд: ARM NEON, x86 AVX2
+- [x] Базовые форматы квантизации: Q4_0, Q8_0, BQ1_0, TQ1_0
+- [x] Нормализация: RMS norm, RoPE
+- [x] Активации: SiLU (SwiGLU), softmax, GELU
+- [x] HTTP API: `/v1/completions`, function calling
+- [ ] Поддержка MoE архитектур (router, expert dispatch) — частично
 - [ ] mmap + expert streaming (Colibri-style)
 
-### Архитектура движка
-```
-calm.c
-├── gguf.c/h          — парсер GGUF
-├── model.c/h         — архитектуры (MoE/dense)
-├── tensor.c/h        — тензорные операции
-├── quant.c/h         — квантизация/деквантизация
-├── backend.c/h       — CPU / GPU абстракция
-├── memory.c/h        — mmap, streaming, LRU cache
-├── sampler.c/h       — семплинг (top-k, top-p, temp)
-└── tokenizer.c/h     — BPE токенизатор
-```
-
 ### Время: 2-3 недели
-### Код: C11, ~5000 строк
+### Код: C11, ~8000 строк
 
 ---
 
-## Фаза 2: Экстремальная квантизация
+## Фаза 2: Экстремальная квантизация (v0.2 — завершена)
 
 **Цель:** Добавить 1-bit (binary) и ternary форматы, совместимые с Bonsai.
 
 ### Компоненты
-- [ ] Формат `TQ1_0` — 1-bit ternary {−1, 0, +1} (log₂3 ≈ 1.58 бита)
-- [ ] Формат `BQ1_0` — 1-bit binary {−1, +1} с групповым scaling (1.125 бита)
-- [ ] Конвертер из FP16/FP32 в 1-bit/ternary
-- [ ] CPU ядра: NEON/AVX2 для бинарных matmul
+- [x] Формат `TQ1_0` — 1-bit ternary {−1, 0, +1} (log₂3 ≈ 1.58 бита)
+- [x] Формат `BQ1_0` — 1-bit binary {−1, +1} с групповым scaling (1.125 бита)
+- [x] Конвертер из FP16/FP32 в 1-bit/ternary
+- [x] CPU ядра: NEON для бинарных matmul
 - [ ] Калибровочный датасет для PTQ
 
 ### Интеграция с Bonsai
@@ -100,8 +90,8 @@ calm convert --input qwen3.6-27b-fp16 --output ternary-2bit --format tq1_0
 **Цель:** Аппаратное ускорение на всех платформах.
 
 ### Компоненты
-- [ ] Vulkan бэкенд (Android Adreno, туева хуча)
-- [ ] Metal бэкенд (Apple Silicon) — можно взять из bitnet.c
+- [x] **Vulkan бэкенд** (Android Adreno) — Q8_0 matmul offload, batch dispatch, HOST_VISIBLE weights
+- [ ] Metal бэкенд (Apple Silicon)
 - [ ] CUDA бэкенд (NVIDIA)
 - [ ] WebGPU бэкенд (браузер)
 - [ ] Гибрид CPU+GPU: горячие эксперты на GPU, холодные на CPU
@@ -174,12 +164,12 @@ calm convert --input qwen3.6-27b-fp16 --output ternary-2bit --format tq1_0
 ## Итого: Roadmap
 
 ```
-Фаза 0: Calm CLI (Python)       │ ████░░░░░░░░░░  1-2 дня    ← ТЫ ЗДЕСЬ
-Фаза 1: Native C engine           │ ████████░░░░░░  2-3 нед
-Фаза 2: 1-bit/ternary quant      │ ████████████░░  2-4 нед
-Фаза 3: GPU backends (Vulkan...) │ ██████████████  4-8 нед
-Фаза 4: Auto-config + smart      │ ██████████████  1-2 нед
-Фаза 5: Production release       │ ██████████████  4-8 нед
+Фаза 0: Calm CLI (Python)       │ ████████████████  1-2 дня    ✅
+Фаза 1: Native C engine         │ ████████████████  2-3 нед    ✅ v0.2
+Фаза 2: 1-bit/ternary quant     │ ████████████████  2-4 нед    ✅ v0.2
+Фаза 3: GPU backends (Vulkan)   │ ████░░░░░░░░░░░░  4-8 нед    ◐ Vulkan done, остальное
+Фаза 4: Auto-config + smart     │ ░░░░░░░░░░░░░░░░  1-2 нед
+Фаза 5: Production release       │ ░░░░░░░░░░░░░░░░  4-8 нед
                                     └── 3-6 месяцев всего
 ```
 
@@ -188,9 +178,11 @@ calm convert --input qwen3.6-27b-fp16 --output ternary-2bit --format tq1_0
 ## Быстрые победы (можно сделать сегодня)
 
 1. ✅ **Calm CLI** — уже написан (Python, работает через Ollama)
-2. 📦 Запустить Qwythos-9B на телефоне — `calm run ./qwythos-9b.gguf`
-3. 📦 Эксперимент: собрать llama.cpp с Vulkan и сравнить скорость
-4. 📦 Написать конвертер Bonsai GGUF → Calm native format
+2. ✅ **Vulkan GPU бэкенд** — Q8_0 matmul offload на Adreno
+3. 📦 Запустить Qwythos-9B на телефоне — `calm run ./qwythos-9b.gguf`
+4. 📦 Эксперимент: собрать llama.cpp с Vulkan и сравнить скорость
+5. 📦 Metal бэкенд (Apple Silicon)
+6. 📦 SSE / streaming для HTTP API
 
 ---
 

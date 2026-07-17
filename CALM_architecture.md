@@ -22,6 +22,10 @@ calm                      # Main binary — CLI + generation loop
 ├── calm_tools.c          #   Function/tool calling (Qwen2.5 format, JSON parser)
 
 └── calm_convert.c        # Standalone converter: FP32/Q8_0 → BQ1_0/TQ1_0
+├── calm_vulkan.c         #   Vulkan GPU compute backend (Q8_0 matmul on Adreno)
+├── calm_vulkan.h         #   Vulkan backend API
+└── shaders/              #   GLSL compute shaders (offline SPIR-V compilation)
+    └── q8_0_matmul.comp  #     Batch Q8_0 matrix multiply
 ```
 
 ```
@@ -163,13 +167,13 @@ Tools defined as JSON file, passed via `--tools`. Calm executes Qwen2.5 `<|tool_
 ```
 Input: hidden[n_embd]
 For each layer:
-  1. RMS norm → Q, K, V projections
+  1. RMS norm → Q, K, V projections (GPU batch: 3 matmuls × 1 submit)
   2. RoPE on Q and K
   3. K_cache[pos] = K, V_cache[pos] = V
   4. Scaled dot-product attention: softmax(Q @ K_cache^T / sqrt(hd)) @ V_cache
-  5. Attention output projection
+  5. Attention output projection (GPU batch: 1 matmul)
   6. Residual connection
-  7. RMS norm → SwiGLU FFN (gate @ up → SiLU(gate) * up → down)
+  7. RMS norm → SwiGLU FFN (GPU batch: gate+up 2 matmuls, then down 1 matmul)
   8. Residual connection
 Final: RMS norm → output projection → logits[n_vocab]
 ```
@@ -246,22 +250,39 @@ GPT-2 BPE tokenizer with byte-level decoding.
 
 ```bash
 make                # calm + calm_convert
-make calm         # main binary only
-make calm_convert # converter only
+make calm           # main binary only
+make calm-vk        # with Vulkan GPU backend (ARM NEON + Vulkan)
+make shaders        # recompile GLSL → SPIR-V
+make calm_convert   # converter only
 make clean          # remove build artifacts
 ```
+
+### Vulkan Requirements
+
+- `glslangValidator` for shader compilation (or use prebuilt `shaders/q8_0_matmul_spv.h`)
+- Vulkan headers (Android: included via NDK; Linux: `apt install vulkan-headers`)
+- Android: `libvulkan.so` is pre-loaded at runtime (no link-time dependency)
 
 ---
 
 ## 9. Roadmap
+
+### Done
+
+- [x] **Vulkan GPU compute backend** (Android Adreno 730) — Q8_0 matmul offload, batch dispatch, host-coherent weights
+- [x] **BQ1_0 / TQ1_0** binary/ternary quantization formats
+- [x] **GGUF parser** — v3 format, any LLaMA-family architecture
+- [x] **BPE tokenizer** — GPT-2 byte-level, merged-id precomputation
+- [x] **HTTP API** — OpenAI-compatible `/v1/completions`
+- [x] **Function calling** — Qwen2.5 `<|tool_call|>` format
 
 ### Short-term [PLANNED]
 
 - [ ] Streaming/SSE for `/v1/completions?stream=true`
 - [ ] `/v1/chat/completions` endpoint (OpenAI chat format)
 - [ ] Model name in server responses (instead of filesystem path)
-- [ ] `--help` on subcommands
 - [ ] Token count propagation in server response
+- [ ] `--help` on subcommands
 
 ### Medium-term [PLANNED]
 
@@ -273,11 +294,11 @@ make clean          # remove build artifacts
 
 ### Long-term [PLANNED]
 
-- [ ] Vulkan compute backend for GPU inference
 - [ ] Metal backend for Apple Silicon
 - [ ] Expert cache with adaptive quantization (hot=Q4, cold=Q2/BQ1)
 - [ ] Multi-model serving
 - [ ] CUDA backend
+- [ ] WebGPU backend (browser)
 
 ---
 
