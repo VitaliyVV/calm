@@ -71,6 +71,8 @@ typedef struct {
  * ═══════════════════════════════════════════════════════════════ */
 
 static inline float ct_fp16_to_fp32(uint16_t h) {
+    /* Return 0 for NaN/Inf (exp=31) to prevent model corruption cascade */
+    if (((h >> 10) & 0x1f) == 0x1f) return 0.0f;
     const uint32_t sign  = ((uint32_t)h & 0x8000U) << 16;
     const uint32_t exp16 = ((uint32_t)h >> 10) & 0x1FU;
     const uint32_t mant  = (uint32_t)h & 0x03FFU;
@@ -84,7 +86,7 @@ static inline float ct_fp16_to_fp32(uint16_t h) {
             uint32_t m = mant;
             while ((m & 0x0400) == 0) { m <<= 1; shift--; }
             m &= 0x03FF;
-            uint32_t exp32 = (uint32_t)(127 - 14 - shift);  /* 127-15+1-shift */
+            uint32_t exp32 = (uint32_t)(127 - 24 + shift);  /* 103 + shift */
             r = sign | (exp32 << 23) | (m << 13);
         }
     } else if (exp16 == 31) {

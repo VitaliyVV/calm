@@ -519,6 +519,27 @@ size_t ct_gguf_tensor_size(int type, int n_dims, const uint64_t* dims) {
             int nb = (int)((cols + 31) / 32);
             return (size_t)rows * nb * 20;
         }
+        /* Missing standard types */
+        case CT_GGUF_TYPE_Q5_0: {
+            int nb = (int)((cols + 31) / 32);
+            return (size_t)rows * nb * 22;  /* uint16 d + uint8 qh[4] + uint8 qs[16] = 22 */
+        }
+        case CT_GGUF_TYPE_Q4_K: {
+            int nb = (int)((cols + 255) / 256);
+            return (size_t)rows * nb * 144; /* uint16 d + uint16 dmin + uint8[12] + uint8[128] = 144 */
+        }
+        case CT_GGUF_TYPE_Q5_K: {
+            int nb = (int)((cols + 255) / 256);
+            return (size_t)rows * nb * 178; /* Q5_K: 178 bytes/256-quant block */
+        }
+        case CT_GGUF_TYPE_Q6_K: {
+            int nb = (int)((cols + 255) / 256);
+            return (size_t)rows * nb * 210; /* uint16 d + uint8 ql[128] + uint8 qh[64] + int8[16] = 210 */
+        }
+        case CT_GGUF_TYPE_Q8_K: {
+            int nb = (int)((cols + 127) / 128);
+            return (size_t)rows * nb * 130; /* uint16 d + uint8 qs[128] = 130, 128 elem/block */
+        }
         /* Our custom formats */
         case CT_GGUF_TYPE_BQ1_0: {
             int ng = (int)((cols + 127) / 128);

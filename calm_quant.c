@@ -39,7 +39,7 @@ static void ct_fp16_init(void) {
                 uint32_t m = mant;
                 while ((m & 0x0400) == 0) { m <<= 1; shift--; }
                 m &= 0x03FF;
-                uint32_t exp_f32 = (uint32_t)(127 - 14 - shift);
+                uint32_t exp_f32 = (uint32_t)(127 - 24 + shift);
                 r = sign | (exp_f32 << 23) | (m << 13);
             }
         } else if (exp_f16 == 31) {
@@ -54,12 +54,9 @@ static void ct_fp16_init(void) {
 }
 
 static inline float fp16_to_f32(uint16_t h) {
-    float v = ct_fp16_table[h];
-    if (h == 0x3C00 && v < 0.5f) {
-        fprintf(stderr, "[fp16] WARN: table[0x3C00]=%f (expected 1.0) table_init=%d\n",
-                v, ct_fp16_table_init);
-    }
-    return v;
+    /* Return 0 for NaN/Inf (exp=31) to prevent model corruption cascade */
+    if (((h >> 10) & 0x1f) == 0x1f) return 0.0f;
+    return ct_fp16_table[h];
 }
 
 /* ═══════════════════════════════════════════════════════════════

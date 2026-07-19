@@ -8,6 +8,11 @@
 *.gguf
 *.o
 *.su
+*.a
+
+# Download temp files
+*.downloading
+*.part
 *.swo
 *.swp
 *~

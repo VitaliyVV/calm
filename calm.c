@@ -1516,6 +1516,15 @@ static void strip_tool_calls(char* text) {
     *tag = '\0';
 }
 
+/* ─── Check if tokenizer uses Llama-style chat format (start_header_id) ─── */
+static int is_llama_chat(ct_tokenizer* tok) {
+    for (int i = 0; i < tok->n_specials; i++) {
+        if (strcmp(tok->specials[i].str, "<|start_header_id|>") == 0)
+            return 1;
+    }
+    return 0;
+}
+
 /* ─── Tool calling: build the full chat prompt with optional tools ─── */
 static int build_chat_prompt(ct_tokenizer* tok, const char* user_prompt,
                               const CalmToolDefinitions* tools,
@@ -1523,25 +1532,65 @@ static int build_chat_prompt(ct_tokenizer* tok, const char* user_prompt,
     char chat_buf[16384];
     int pos = 0;
 
-    /* System message */
-    int n = snprintf(chat_buf + pos, sizeof(chat_buf) - pos,
-        "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. "
-        "You are a helpful assistant.");
-    if (n > 0 && (size_t)n < sizeof(chat_buf) - pos) pos += (size_t)n;
+    if (is_llama_chat(tok)) {
+        /* Llama 3.x format:
+         * <|start_header_id|>system<|end_header_id|>
+         *
+         * {system message}<|eot_id|>
+         * <|start_header_id|>user<|end_header_id|>
+         *
+         * {user message}<|eot_id|>
+         * <|start_header_id|>assistant<|end_header_id|>
+         *
+         * (BOS is added by ct_tokenizer_encode via add_bos flag)
+         */
+        /* System message */
+        int n = snprintf(chat_buf + pos, sizeof(chat_buf) - pos,
+            "<|start_header_id|>system<|end_header_id|>\n\n"
+            "You are a helpful assistant.");
+        if (n > 0 && (size_t)n < sizeof(chat_buf) - pos) pos += (size_t)n;
 
-    /* Append tool definitions if any */
-    if (tools && tools->count > 0) {
-        char tool_buf[8192];
-        ct_tools_format_system(tools, tool_buf, sizeof(tool_buf));
-        n = snprintf(chat_buf + pos, sizeof(chat_buf) - pos, "%s", tool_buf);
+        /* Append tool definitions if any */
+        if (tools && tools->count > 0) {
+            char tool_buf[8192];
+            ct_tools_format_system(tools, tool_buf, sizeof(tool_buf));
+            n = snprintf(chat_buf + pos, sizeof(chat_buf) - pos, "%s", tool_buf);
+            if (n > 0 && (size_t)n < sizeof(chat_buf) - pos) pos += (size_t)n;
+        }
+
+        /* EOT + user */
+        n = snprintf(chat_buf + pos, sizeof(chat_buf) - pos,
+            "<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n"
+            "%s"
+            "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
+            user_prompt);
+        if (n > 0 && (size_t)n < sizeof(chat_buf) - pos) pos += (size_t)n;
+    } else {
+        /* Qwen format:
+         * <|im_start|>system\n{msg}<|im_end|>\n
+         * <|im_start|>user\n{msg}<|im_end|>\n
+         * <|im_start|>assistant\n
+         */
+        /* System message */
+        int n = snprintf(chat_buf + pos, sizeof(chat_buf) - pos,
+            "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. "
+            "You are a helpful assistant.");
+        if (n > 0 && (size_t)n < sizeof(chat_buf) - pos) pos += (size_t)n;
+
+        /* Append tool definitions if any */
+        if (tools && tools->count > 0) {
+            char tool_buf[8192];
+            ct_tools_format_system(tools, tool_buf, sizeof(tool_buf));
+            n = snprintf(chat_buf + pos, sizeof(chat_buf) - pos, "%s", tool_buf);
+            if (n > 0 && (size_t)n < sizeof(chat_buf) - pos) pos += (size_t)n;
+        }
+
+        /* Close system, add user */
+        n = snprintf(chat_buf + pos, sizeof(chat_buf) - pos,
+            "<|im_end|>\n<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n",
+            user_prompt);
         if (n > 0 && (size_t)n < sizeof(chat_buf) - pos) pos += (size_t)n;
     }
-
-    /* Close system, add user */
-    n = snprintf(chat_buf + pos, sizeof(chat_buf) - pos,
-        "<|im_end|>\n<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n",
-        user_prompt);
-    if (n > 0 && (size_t)n < sizeof(chat_buf) - pos) pos += (size_t)n;
 
     chat_buf[pos] = '\0';
 
@@ -1690,20 +1739,27 @@ CalmError calm_model_generate_native(CalmModel* model,
     char conversation[CALM_MAX_STRING] = {0};
     size_t conv_pos = 0;
 
+    /* Determine format strings based on model */
+    int llama_fmt = is_llama_chat(model->tokenizer);
+    const char* fmt_sys_open  = llama_fmt ? "<|start_header_id|>system<|end_header_id|>\n\n" : "<|im_start|>system\n";
+    const char* fmt_user_open = llama_fmt ? "<|start_header_id|>user<|end_header_id|>\n\n" : "<|im_start|>user\n";
+    const char* fmt_asst_open = llama_fmt ? "<|start_header_id|>assistant<|end_header_id|>\n\n" : "<|im_start|>assistant\n";
+    const char* fmt_close     = llama_fmt ? "<|eot_id|>" : "<|im_end|>\n";
+    const char* fmt_sys_msg   = llama_fmt ? "You are a helpful assistant." : "You are Qwen, created by Alibaba Cloud. You are a helpful assistant.";
+
     {
         char init_buf[16384];
-        int n = snprintf(init_buf, sizeof(init_buf),
-            "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. "
-            "You are a helpful assistant.");
-        int p = n > 0 && (size_t)n < sizeof(init_buf) ? (size_t)n : 0;
+        int p = 0;
+        int n = snprintf(init_buf + p, sizeof(init_buf) - (size_t)p,
+            "%s%s", fmt_sys_open, fmt_sys_msg);
+        if (n > 0 && (size_t)n < sizeof(init_buf) - (size_t)p) p += (size_t)n;
         if (tools && tools->count > 0) {
             char tool_buf[8192];
             ct_tools_format_system(tools, tool_buf, sizeof(tool_buf));
             n = snprintf(init_buf + p, sizeof(init_buf) - (size_t)p, "%s", tool_buf);
             if (n > 0 && (size_t)n < sizeof(init_buf) - (size_t)p) p += (size_t)n;
         }
-        n = snprintf(init_buf + p, sizeof(init_buf) - (size_t)p,
-            "<|im_end|>\n");
+        n = snprintf(init_buf + p, sizeof(init_buf) - (size_t)p, "%s", fmt_close);
         if (n > 0 && (size_t)n < sizeof(init_buf) - (size_t)p) p += (size_t)n;
         init_buf[p] = '\0';
         if ((size_t)p < sizeof(conversation)) {
@@ -1715,7 +1771,7 @@ CalmError calm_model_generate_native(CalmModel* model,
     /* Add user message */
     {
         int n = snprintf(conversation + conv_pos, sizeof(conversation) - conv_pos,
-            "<|im_start|>user\n%s<|im_end|>\n", prompt);
+            "%s%s%s", fmt_user_open, prompt, fmt_close);
         if (n > 0 && (size_t)n < sizeof(conversation) - conv_pos)
             conv_pos += (size_t)n;
     }
@@ -1723,7 +1779,7 @@ CalmError calm_model_generate_native(CalmModel* model,
     /* Initial assistant response */
     {
         int n = snprintf(conversation + conv_pos, sizeof(conversation) - conv_pos,
-            "<|im_start|>assistant\n%s", response);
+            "%s%s", fmt_asst_open, response);
         if (n > 0 && (size_t)n < sizeof(conversation) - conv_pos)
             conv_pos += (size_t)n;
     }
@@ -2888,6 +2944,7 @@ int main(int argc, char** argv) {
         float top_k = 40.0f;
         float repeat_penalty = 1.1f;
         int max_tokens = 20;
+        int raw_prompt = 0;
         for (int i = 3; i < argc; i++) {
             if (strcmp(argv[i], "--backend") == 0 && i + 1 < argc) {
                 i++; /* already handled in pre-parse */
@@ -2905,6 +2962,8 @@ int main(int argc, char** argv) {
                 top_k = (float)atof(argv[++i]);
             } else if (strcmp(argv[i], "--repeat-penalty") == 0 && i + 1 < argc) {
                 repeat_penalty = (float)atof(argv[++i]);
+            } else if (strcmp(argv[i], "--raw-prompt") == 0) {
+                raw_prompt = 1;
             } else if (strcmp(argv[i], "--max-tokens") == 0 && i + 1 < argc) {
                 max_tokens = atoi(argv[++i]);
                 if (max_tokens < 1) max_tokens = 1;
@@ -2942,20 +3001,49 @@ int main(int argc, char** argv) {
 
         // Generate
         char output[CALM_MAX_OUTPUT] = {0};
-        CalmGenerateParams params = {
-            .temperature = temp,
-            .top_p = top_p,
-            .top_k = top_k,
-            .repeat_penalty = repeat_penalty,
-            .max_tokens = max_tokens,
-            .stream = false,
-            .tools = (tool_defs.count > 0) ? &tool_defs : NULL,
-            .max_tool_rounds = 5,
-        };
+        if (raw_prompt) {
+            /* ── Raw prompt: skip chat template, tokenize directly ── */
+            int tokens[4096];
+            int n_prompt = ct_tokenizer_encode(model->tokenizer, prompt, tokens, 2048);
+            if (n_prompt < 1) {
+                fprintf(stderr, "Tokenization failed.\n");
+                err = CALM_ERR_GENERIC;
+            } else {
+                int eos_id = model->tokenizer ? model->tokenizer->eos_id : -1;
+                int n_gen = max_tokens;
+                int total = ct_infer_generate(model->infer, tokens, n_prompt,
+                                               max_tokens, temp, eos_id,
+                                               tokens,
+                                               NULL, NULL,
+                                               top_p, repeat_penalty, (int)top_k);
+                if (total < 1) {
+                    snprintf(output, sizeof(output), "Inference failed.\n");
+                    err = CALM_ERR_GENERIC;
+                } else {
+                    ct_tokenizer_decode(model->tokenizer,
+                                         tokens + n_prompt,
+                                         total - n_prompt,
+                                         output, sizeof(output));
+                    printf("%s\n", output);
+                    err = CALM_OK;
+                }
+            }
+        } else {
+            CalmGenerateParams params = {
+                .temperature = temp,
+                .top_p = top_p,
+                .top_k = top_k,
+                .repeat_penalty = repeat_penalty,
+                .max_tokens = max_tokens,
+                .stream = false,
+                .tools = (tool_defs.count > 0) ? &tool_defs : NULL,
+                .max_tool_rounds = 5,
+            };
 
-        err = calm_model_generate(model, prompt, output, sizeof(output), &params);
-        if (err == CALM_OK) {
-            printf("%s\n", output);
+            err = calm_model_generate(model, prompt, output, sizeof(output), &params);
+            if (err == CALM_OK) {
+                printf("%s\n", output);
+            }
         }
 
         calm_model_free(model);

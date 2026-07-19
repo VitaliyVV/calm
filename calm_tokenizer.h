@@ -61,6 +61,10 @@ typedef struct {
 
     /* Byte-to-token lookup for single-byte tokens */
     int byte_to_token[256];
+
+    /* Special tokens discovered from vocab (tokens matching <|...|>) */
+    struct { char* str; int id; int len; }* specials;
+    int n_specials;
 } ct_tokenizer;
 
 /* ─── API ─── */

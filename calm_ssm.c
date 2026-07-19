@@ -187,7 +187,16 @@ void ct_ssm_selective_scan(float* y, const float* x,
 
     for (int i = 0; i < d_inner; i++) {
         float xi = x[i];
-        float dti = expf(dt[i]);  /* discretization step */
+        /* Numerically stable softplus: Δ = log(1 + exp(dt))
+         * For dt > 20: log(1 + exp(dt)) ≈ dt (avoid expf overflow)
+         * For dt < -20: log(1 + exp(dt)) ≈ exp(dt) ≈ 0
+         * Mamba1 always uses softplus for the discretization step Δ. */
+        float dti;
+        if (dt[i] > 20.0f) {
+            dti = dt[i];  /* log(1+exp(dt)) ≈ dt for large dt */
+        } else {
+            dti = logf(1.0f + expf(dt[i]));
+        }
 
         /* Dequantize A[:, i] — elements are at A[s * d_inner + i] for s=0..d_state-1.
          * Since d_state is typically small (16-128), do element-wise dequant. */
@@ -392,7 +401,6 @@ void ct_forward_ssm(float* out, const float* hidden_in,
         for (int i = 0; i < d_inner; i++)
             dt_proj[i] += lw->ssm_dt_b[i];
     }
-
     /* Step 9-10: y = selective_scan(conv_x, dt_proj, B, C, A, D, h_state) */
     ct_ssm_selective_scan(tmp, conv_x, dt_proj, B, C,
                           lw->ssm_a, lw->t_ssm_a,

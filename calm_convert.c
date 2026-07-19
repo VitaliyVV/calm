@@ -28,6 +28,8 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
+#include <pthread.h>
 
 /* ═══════════════════════════════════════════════════════════════
  * Tensor classification
@@ -105,18 +107,69 @@ static void dequant_q2_k(const uint8_t* data, float* out, int cols, int blk_idx)
 }
 
 /* Q3_K: 3-bit, 256-element super-blocks
- *   8 sub-blocks of 32 elements, 6-bit scale per sub-block
- *   Plus high-bit mask for the extra bit
- *   Structure: d(F16) dmin(F16) hmask[4] scales[12] qs[96]
- *   size = 116 bytes per 256 elements = 0.453125 bpw
+ *   Layout: d(F16,2B) + dmin(F16,2B) + hmask[4] + qs[96] + scales[12] = 116B
+ *   qs: 2-bit low bits packed 4/byte
+ *   hmask: 1-bit high bit per element (bit=0 → subtract 4, making 3-bit signed)
+ *   scales[12]: 16 × 6-bit values unpacked to int8[d-scale-8, dmin-scale-8]
+ *   NOTE: dmin IS stored in the block but the llama.cpp dequant only uses d_all.
  */
 static void dequant_q3_k(const uint8_t* data, float* out, int cols, int blk_idx) {
-    (void)blk_idx;
-    // Placeholder — proper implementation uses complex scale decoding
-    // For now, zero out (requant will still work, just noisier source)
+    float d_all = ct_fp16_to_fp32(*(const uint16_t*)(data));
+    const uint8_t* hm = data + 4;    // hmask: 4 bytes
+    const uint8_t* q = data + 8;     // qs: 96 bytes
     int base = blk_idx * 256;
-    for (int j = 0; j < 256 && base + j < cols; j++)
-        out[base + j] = 0.0f;
+
+    // Unpack scales[12] → 16 int8 values (llama.cpp algorithm)
+    uint32_t aux[4];
+    memcpy(aux, data + 104, 12);
+    const uint32_t kmask1 = 0x03030303;
+    const uint32_t kmask2 = 0x0f0f0f0f;
+    uint32_t tmp = aux[2];
+    aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+    aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+    aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
+    aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
+    const int8_t* scales = (const int8_t*)aux;
+
+    int is = 0;
+    for (int n = 0; n < 256; n += 128) {
+        int shift = 0;
+        for (int j = 0; j < 4; j++) {
+            float dl = d_all * (float)(scales[is++] - 32);
+            for (int l = 0; l < 16; l++) {
+                int idx = base + n + j * 32 + l;
+                if (idx >= cols) return;
+                int qval = (q[l] >> shift) & 3;
+                if (!(hm[l] & (1u << j))) qval -= 4;
+                out[idx] = dl * (float)qval;
+            }
+            dl = d_all * (float)(scales[is++] - 32);
+            for (int l = 0; l < 16; l++) {
+                int idx = base + n + j * 32 + 16 + l;
+                if (idx >= cols) return;
+                int qval = (q[l + 16] >> shift) & 3;
+                if (!(hm[l + 16] & (1u << j))) qval -= 4;
+                out[idx] = dl * (float)qval;
+            }
+            shift += 2;
+        }
+        q += 32;
+    }
+}
+
+/* Q8_K: 8-bit, 128-element super-blocks
+ *   Layout: d(F16,2B) + qs[128] = 130 bytes
+ *   Single scale d for all 128 values
+ */
+static void dequant_q8_k(const uint8_t* data, float* out, int cols, int blk_idx) {
+    float d = ct_fp16_to_fp32(*(const uint16_t*)(data));
+    const int8_t* qs = (const int8_t*)(data + 2);
+    int base = blk_idx * 128;
+    for (int j = 0; j < 128; j++) {
+        int idx = base + j;
+        if (idx >= cols) return;
+        out[idx] = (float)qs[j] * d;
+    }
 }
 
 /* Q4_K: 4-bit, 256-element super-blocks (most common: Q4_K_M, Q4_K_S)
@@ -386,7 +439,6 @@ static void dequant_row(const void* data, int src_type, float* out, int cols) {
             return;
         }
         case CT_GGUF_TYPE_Q3_K: {
-            /* Q3_K: placeholder */
             int nblk = (cols + 255) / 256;
             for (int b = 0; b < nblk; b++)
                 dequant_q3_k((const uint8_t*)data + (size_t)b * 116, out, cols, b);
@@ -407,7 +459,13 @@ static void dequant_row(const void* data, int src_type, float* out, int cols) {
         case CT_GGUF_TYPE_Q6_K: {
             int nblk = (cols + 255) / 256;
             for (int b = 0; b < nblk; b++)
-                dequant_q6_k((const uint8_t*)data + (size_t)b * 204, out, cols, b);
+                dequant_q6_k((const uint8_t*)data + (size_t)b * 210, out, cols, b);
+            return;
+        }
+        case CT_GGUF_TYPE_Q8_K: {
+            int nblk = (cols + 127) / 128;
+            for (int b = 0; b < nblk; b++)
+                dequant_q8_k((const uint8_t*)data + (size_t)b * 130, out, cols, b);
             return;
         }
         default: {
@@ -504,9 +562,17 @@ static size_t row_size_bytes(int cols, int type) {
             int nb = (cols + 255) / 256;
             return (size_t)nb * 210;  // ql(128)+qh(64)+scales(16)+d(2)
         }
+        case CT_GGUF_TYPE_Q3_K: {
+            int nb = (cols + 255) / 256;
+            return (size_t)nb * 116;  // d(2)+dmin(2)+hmask(4)+qs(96)+scales(12)
+        }
         case CT_GGUF_TYPE_Q2_K: {
             int nb = (cols + 255) / 256;
             return (size_t)nb * 80;
+        }
+        case CT_GGUF_TYPE_Q8_K: {
+            int nb = (cols + 127) / 128;
+            return (size_t)nb * 130;  // d(2)+qs(128)
         }
         case CT_GGUF_TYPE_BQ1_0: {
             int ng = (cols + 127) / 128;
@@ -609,10 +675,19 @@ static bool stream_tensor(FILE* out,
         return false;
     }
 
+    const void* tensor_base = ct_gguf_tensor_data(src, t);
     double peak_mb = 0;
     for (int r = 0; r < rows; r++) {
         /* Source row from mmap (zero-copy) */
-        const void* src_row = ct_gguf_tensor_data(src, t) + (size_t)r * src_stride;
+        const void* src_row = (const uint8_t*)tensor_base + (size_t)r * src_stride;
+
+        /* Validate row is within mmap bounds */
+        if ((const uint8_t*)src_row + src_stride > (const uint8_t*)src->data + src->size) {
+            fprintf(stderr, "\n  Error: tensor '%s' row %d exceeds mmap (offset=%zu, size=%zu, mmap=%zu)\n",
+                    tname, r, (size_t)r * src_stride, src_stride, src->size);
+            free(row_buf); free(dst_buf);
+            return false;
+        }
 
         /* Dequant → float */
         dequant_row(src_row, t->type, row_buf, cols);
@@ -643,9 +718,10 @@ static bool stream_tensor(FILE* out,
  * ═══════════════════════════════════════════════════════════════ */
 
 static bool write_header_and_metadata(FILE* f, const ct_gguf_context* src,
-                                       const int* out_types,
-                                       const size_t* out_sizes,
-                                       int n_tensors) {
+                                        const int* out_types,
+                                        const size_t* out_sizes,
+                                        const size_t* out_offsets,
+                                        int n_tensors) {
     /* 1. Header */
     uint32_t magic = CT_GGUF_MAGIC;
     uint32_t version = 3;
@@ -779,8 +855,7 @@ static bool write_header_and_metadata(FILE* f, const ct_gguf_context* src,
         }
     }
 
-    /* 3. Tensor info */
-    size_t current_offset = 0;
+    /* 3. Tensor info — use pre-computed offsets from Pass 1 */
     for (int i = 0; i < n_tensors; i++) {
         const ct_gguf_tensor_info* t = &src->tensors[i];
         size_t tname_len = strlen(t->name);
@@ -797,13 +872,9 @@ static bool write_header_and_metadata(FILE* f, const ct_gguf_context* src,
         int actual_type = out_types ? out_types[i] : (int)t->type;
         fwrite(&actual_type, 4, 1, f);
 
-        /* Write offset */
-        fwrite(&current_offset, 8, 1, f);
-        current_offset += out_sizes[i];
-
-        /* Align to 32 bytes */
-        while (current_offset % 32 != 0)
-            current_offset++;
+        /* Use pre-computed 32-byte aligned offset from Pass 1 */
+        size_t off = out_offsets ? out_offsets[i] : 0;
+        fwrite(&off, 8, 1, f);
     }
 
     /* Pad to 32-byte alignment */
@@ -818,6 +889,299 @@ static bool write_header_and_metadata(FILE* f, const ct_gguf_context* src,
 }
 
 /* ═══════════════════════════════════════════════════════════════
+ * Post-conversion verification: open output GGUF and validate
+ * ═══════════════════════════════════════════════════════════════ */
+
+static bool verify_gguf(const char* path) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) { fprintf(stderr, "  Verify: cannot open %s\n", path); return false; }
+
+    struct stat st;
+    if (fstat(fd, &st) != 0) { close(fd); return false; }
+    size_t file_size = (size_t)st.st_size;
+
+    /* mmap the output file for verification */
+    void* data = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (data == MAP_FAILED) { fprintf(stderr, "  Verify: mmap failed\n"); return false; }
+
+    /* Parse GGUF header */
+    const uint8_t* buf = (const uint8_t*)data;
+    if (buf[0] != 'G' || buf[1] != 'G' || buf[2] != 'U' || buf[3] != 'F') {
+        fprintf(stderr, "  Verify: bad magic\n");
+        munmap(data, file_size); return false;
+    }
+
+    uint64_t n_tensors;
+    memcpy(&n_tensors, buf + 8, 8);
+    uint64_t n_metadata;
+    memcpy(&n_metadata, buf + 16, 8);
+
+    /* Skip header + metadata to find tensor info start */
+    size_t pos = 24;
+    for (uint64_t m = 0; m < n_metadata; m++) {
+        if (pos + 8 > file_size) goto verify_trunc;
+        uint64_t klen; memcpy(&klen, buf + pos, 8); pos += 8;
+        pos += (size_t)klen; /* skip key */
+        if (pos + 4 > file_size) goto verify_trunc;
+        uint32_t vtype; memcpy(&vtype, buf + pos, 4); pos += 4;
+        switch (vtype) {
+            case 0: case 1: case 7: pos += 1; break;
+            case 2: case 3: pos += 2; break;
+            case 4: case 5: case 6: pos += 4; break;
+            case 8: {
+                if (pos + 8 > file_size) goto verify_trunc;
+                uint64_t sl; memcpy(&sl, buf + pos, 8); pos += 8;
+                pos += (size_t)sl; break;
+            }
+            case 9: {
+                uint32_t at; memcpy(&at, buf + pos, 4); pos += 4;
+                uint64_t al; memcpy(&al, buf + pos + 4, 4); pos += 12;
+                size_t elem_size = (at == 8) ? 0 : (at <= 3 ? 2 : (at <= 7 ? 4 : 8));
+                if (at == 8) { /* array of strings — skip each */
+                    for (uint64_t j = 0; j < al; j++) {
+                        uint64_t sl; memcpy(&sl, buf + pos, 8); pos += 8;
+                        pos += (size_t)sl;
+                    }
+                } else {
+                    pos += (size_t)(al * elem_size);
+                }
+                break;
+            }
+            case 10: case 11: case 12: pos += 8; break;
+            default: pos += 4; break;
+        }
+        if (pos > file_size) goto verify_trunc;
+    }
+
+    /* Parse tensor info and validate each tensor's data range */
+    size_t errors = 0;
+    size_t total_data = 0;
+    for (uint64_t i = 0; i < n_tensors; i++) {
+        if (pos + 8 > file_size) { errors++; break; }
+        uint64_t nl; memcpy(&nl, buf + pos, 8); pos += 8;
+        char tname[256];
+        size_t name_len = nl < 255 ? (size_t)nl : 255;
+        memcpy(tname, buf + pos, name_len); tname[name_len] = '\0';
+        pos += (size_t)nl;
+
+        uint32_t nd; memcpy(&nd, buf + pos, 4); pos += 4;
+        uint64_t dims[4] = {0};
+        for (uint32_t d = 0; d < nd && d < 4; d++) {
+            memcpy(&dims[d], buf + pos, 8); pos += 8;
+        }
+
+        uint32_t tt; memcpy(&tt, buf + pos, 4); pos += 4;
+        uint64_t toff; memcpy(&toff, buf + pos, 8); pos += 8;
+
+        /* Compute expected size */
+        int rows = (nd > 1) ? (int)dims[1] : 1;
+        int cols = (int)dims[0];
+        size_t expected = row_size_bytes(cols, (int)tt) * (size_t)rows;
+        total_data += expected;
+
+        /* Align tensor data start (same as in write_header_and_metadata) */
+        size_t data_start = 0;
+        /* tensor_data_offset is computed below */
+    }
+
+    /* Tensor data section starts after all tensor info, 32-byte aligned */
+    size_t tensor_data_off = (pos + 31) & ~(size_t)31;
+
+    /* Second pass: validate with known data start */
+    pos = 24; /* rewind for clean count */
+    for (uint64_t m = 0; m < n_metadata; m++) {
+        uint64_t kl; memcpy(&kl, buf + pos, 8); pos += 8;
+        pos += (size_t)kl;
+        uint32_t vt; memcpy(&vt, buf + pos, 4); pos += 4;
+        switch (vt) {
+            case 0: case 1: case 7: pos += 1; break;
+            case 2: case 3: pos += 2; break;
+            case 4: case 5: case 6: pos += 4; break;
+            case 8: { uint64_t sl; memcpy(&sl, buf + pos, 8); pos += 8; pos += (size_t)sl; break; }
+            case 9: {
+                uint32_t at; memcpy(&at, buf + pos, 4); pos += 4;
+                uint64_t al; memcpy(&al, buf + pos, 4); pos += 12;
+                if (at == 8) { for (uint64_t j = 0; j < al; j++) { uint64_t sl; memcpy(&sl, buf + pos, 8); pos += 8; pos += (size_t)sl; } }
+                else { size_t es = (at <= 3 ? 2 : (at <= 7 ? 4 : 8)); pos += (size_t)(al * es); }
+                break;
+            }
+            case 10: case 11: case 12: pos += 8; break;
+            default: pos += 4; break;
+        }
+    }
+
+    errors = 0;
+    for (uint64_t i = 0; i < n_tensors; i++) {
+        uint64_t nl; memcpy(&nl, buf + pos, 8); pos += 8;
+        char tname[256];
+        size_t name_len = nl < 255 ? (size_t)nl : 255;
+        memcpy(tname, buf + pos, name_len); tname[name_len] = '\0';
+        pos += (size_t)nl;
+
+        uint32_t nd; memcpy(&nd, buf + pos, 4); pos += 4;
+        uint64_t dims[4] = {0};
+        for (uint32_t d = 0; d < nd && d < 4; d++) {
+            memcpy(&dims[d], buf + pos, 8); pos += 8;
+        }
+        uint32_t tt; memcpy(&tt, buf + pos, 4); pos += 4;
+        uint64_t toff; memcpy(&toff, buf + pos, 8); pos += 8;
+
+        int rows = (nd > 1) ? (int)dims[1] : 1;
+        int cols = (int)dims[0];
+        size_t stride = row_size_bytes(cols, (int)tt);
+        size_t tsize = stride * (size_t)rows;
+        size_t abs_end = tensor_data_off + (size_t)toff + tsize;
+
+        if (abs_end > file_size) {
+            fprintf(stderr, "  Verify: '%s' %s overflows: offset=%llu end=%zu file=%zu (off by %zu)\n",
+                    tname, ct_gguf_type_name((int)tt),
+                    (unsigned long long)toff, abs_end, file_size, abs_end - file_size);
+            errors++;
+        }
+    }
+
+    munmap(data, file_size);
+
+    if (errors == 0) {
+        printf("  ✅ Verify: %llu tensors, all offsets valid (%zu bytes)\n",
+               (unsigned long long)n_tensors, file_size);
+        return true;
+    }
+    fprintf(stderr, "  ❌ Verify: %zu/%llu tensors FAILED offset check\n",
+            errors, (unsigned long long)n_tensors);
+    return false;
+
+verify_trunc:
+    fprintf(stderr, "  Verify: file truncated during parsing\n");
+    munmap(data, file_size);
+    return false;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * Parallel worker — multi-threaded tensor conversion
+ * ═══════════════════════════════════════════════════════════════ */
+
+typedef struct {
+    int thread_id;
+    int tensor_start;
+    int tensor_end;
+    const ct_gguf_context* src;
+    int out_fd;                /* output fd for pwrite (thread-safe) */
+    size_t data_start;         /* file offset where tensor data section begins */
+    const size_t* out_offsets; /* pre-computed relative offsets */
+    const int* out_types;
+    int dst_type;
+    bool calibrate;
+    const char* format_name;
+    bool preserve_head;
+    volatile bool* global_ok;  /* shared atomic flag, set false on failure */
+} worker_arg;
+
+static void* worker_convert(void* arg) {
+    worker_arg* w = (worker_arg*)arg;
+    const ct_gguf_context* src = w->src;
+    int out_fd = w->out_fd;
+    size_t data_start = w->data_start;
+    int n = w->tensor_end;
+
+    for (int i = w->tensor_start; i < n; i++) {
+        if (!*w->global_ok) return NULL;  /* abort on sibling failure */
+
+        const ct_gguf_tensor_info* t = &src->tensors[i];
+        int rows, cols;
+        if (t->n_dims == 1) {
+            rows = 1;
+            cols = (int)t->dims[0];
+        } else {
+            rows = (int)t->dims[1];
+            cols = (int)t->dims[0];
+        }
+
+        const char* tname = t->name;
+        ct_tensor_class tclass = CT_TENSOR_WEIGHT;
+        size_t nelements = (size_t)rows * cols;
+        if (should_skip(tname) && nelements < 100000)
+            tclass = CT_TENSOR_SKIP;
+        else if (is_head_tensor(tname) && w->preserve_head)
+            tclass = CT_TENSOR_HEAD;
+
+        int actual_dst;
+        if (tclass == CT_TENSOR_SKIP)     actual_dst = t->type;
+        else if (tclass == CT_TENSOR_HEAD) actual_dst = CT_GGUF_TYPE_Q8_0;
+        else                                actual_dst = w->dst_type;
+
+        size_t src_stride = row_size_bytes(cols, t->type);
+        size_t dst_stride = row_size_bytes(cols, actual_dst);
+
+        /* Progress (lock-free — interleaved output is OK for terminal) */
+        printf("  [%3d] %-40s %s (%d×%d, %s",
+               i + 1, tname,
+               tclass == CT_TENSOR_SKIP ? "skip" :
+               tclass == CT_TENSOR_HEAD ? "Q8_0" : w->format_name,
+               rows, cols,
+               ct_gguf_type_name(t->type));
+
+        size_t write_pos = data_start + w->out_offsets[i];
+
+        if (tclass == CT_TENSOR_SKIP) {
+            /* Copy original row-by-row */
+            for (int r = 0; r < rows; r++) {
+                const void* src_row = ct_gguf_tensor_data(src, t) + (size_t)r * src_stride;
+                ssize_t written = pwrite(out_fd, src_row, src_stride, (off_t)(write_pos + (size_t)r * src_stride));
+                if ((size_t)written != src_stride) {
+                    fprintf(stderr, "\n  Error: pwrite failed for '%s' row %d\n", tname, r);
+                    *w->global_ok = false; return NULL;
+                }
+            }
+            printf(" → %s, %.1f MB)\n",
+                   ct_gguf_type_name(t->type),
+                   (rows * src_stride) / (1024.0 * 1024.0));
+            continue;
+        }
+
+        /* Allocate row buffers */
+        float* row_buf = (float*)malloc((size_t)cols * sizeof(float));
+        void* dst_buf = malloc(dst_stride > 0 ? dst_stride : 1);
+        if (!row_buf || !dst_buf) {
+            free(row_buf); free(dst_buf);
+            fprintf(stderr, "\n  Error: OOM for row buffers (%d cols)\n", cols);
+            *w->global_ok = false; return NULL;
+        }
+
+        const void* tensor_base = ct_gguf_tensor_data(src, t);
+        double peak_mb = 0;
+        for (int r = 0; r < rows; r++) {
+            const void* src_row = (const uint8_t*)tensor_base + (size_t)r * src_stride;
+            if ((const uint8_t*)src_row + src_stride > (const uint8_t*)src->data + src->size) {
+                fprintf(stderr, "\n  Error: tensor '%s' row %d exceeds mmap\n", tname, r);
+                free(row_buf); free(dst_buf);
+                *w->global_ok = false; return NULL;
+            }
+            dequant_row(src_row, t->type, row_buf, cols);
+            quantize_row(row_buf, cols, dst_buf, actual_dst, w->calibrate);
+            ssize_t written = pwrite(out_fd, dst_buf, dst_stride,
+                                     (off_t)(write_pos + (size_t)r * dst_stride));
+            if ((size_t)written != dst_stride) {
+                fprintf(stderr, "\n  Error: pwrite failed for '%s' row %d\n", tname, r);
+                free(row_buf); free(dst_buf);
+                *w->global_ok = false; return NULL;
+            }
+            double mb = ((size_t)cols * sizeof(float) + dst_stride) / (1024.0 * 1024.0);
+            if (mb > peak_mb) peak_mb = mb;
+        }
+        free(row_buf);
+        free(dst_buf);
+
+        printf(" → %s, %.1f MB, peak=%.1f MB)\n",
+               ct_gguf_type_name(actual_dst),
+               (rows * dst_stride) / (1024.0 * 1024.0),
+               peak_mb);
+    }
+    return NULL;
+}
+
+/* ═══════════════════════════════════════════════════════════════
  * CLI + Main
  * ═══════════════════════════════════════════════════════════════ */
 
@@ -827,6 +1191,7 @@ int main(int argc, char** argv) {
     const char* format = "tq1_0";
     bool calibrate = false;
     bool preserve_sensitive = true;
+    bool verify = false;
 
     /* Parse args */
     for (int i = 1; i < argc; i++) {
@@ -840,6 +1205,8 @@ int main(int argc, char** argv) {
             calibrate = true;
         else if (strcmp(argv[i], "--no-preserve") == 0)
             preserve_sensitive = false;
+        else if (strcmp(argv[i], "--verify") == 0)
+            verify = true;
         else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             printf("Calm Model Converter v0.2 — Phase 6 (Streaming Requantizer)\n");
             printf("  --input <file.gguf>     Source GGUF model\n");
@@ -847,6 +1214,7 @@ int main(int argc, char** argv) {
             printf("  --output <file.gguf>    Output path\n");
             printf("  --calibrate             MSE-optimal ternary calibration (slower, better quality)\n");
             printf("  --no-preserve           Don't preserve embed/output in Q8_0\n");
+            printf("  --verify                Validate output GGUF after conversion\n");
             printf("  --help                  This help\n");
             printf("\n");
             printf("Peak RAM: ~row_buf + quant_buf ≈ few MB (streaming)\n");
@@ -915,7 +1283,16 @@ int main(int argc, char** argv) {
 
     size_t total_input = 0;
     size_t total_output = 0;
+    /* Pre-computed 32-byte aligned output offsets for each tensor */
+    size_t* out_offsets = malloc((size_t)n * sizeof(size_t));
+    if (!out_offsets) {
+        fprintf(stderr, "Error: OOM for offsets\n");
+        free(out_types); free(out_sizes);
+        ct_gguf_close(src);
+        return 1;
+    }
 
+    size_t running = 0;
     for (int i = 0; i < n; i++) {
         const ct_gguf_tensor_info* t = &src->tensors[i];
         const char* tname = t->name;
@@ -937,6 +1314,10 @@ int main(int argc, char** argv) {
             out_types[i] = dst_type;
 
         out_sizes[i] = tensor_output_size(t, out_types[i]);
+        out_offsets[i] = running;  /* 32-byte aligned */
+        running += out_sizes[i];
+        /* Align to 32 bytes for GGUF v3 spec */
+        while (running % 32 != 0) running++;
         total_input += t->size;
         total_output += out_sizes[i];
     }
@@ -951,53 +1332,84 @@ int main(int argc, char** argv) {
            total_input > 0 ? (100.0 * (1.0 - (double)total_output / (double)total_input)) : 0);
     printf("\n");
 
-    /* Open output file */
-    FILE* out = fopen(output_path, "wb");
-    if (!out) {
+    /* Open output file — fd for parallel pwrite, FILE* for header/metadata */
+    int out_fd = open(output_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (out_fd < 0) {
         fprintf(stderr, "Cannot create: %s\n", output_path);
-        free(out_types); free(out_sizes);
+        free(out_types); free(out_sizes); free(out_offsets);
+        ct_gguf_close(src);
+        return 1;
+    }
+    FILE* out = fdopen(out_fd, "wb");
+    if (!out) {
+        fprintf(stderr, "Cannot fdopen: %s\n", output_path);
+        close(out_fd); remove(output_path);
+        free(out_types); free(out_sizes); free(out_offsets);
         ct_gguf_close(src);
         return 1;
     }
 
     /* === PASS 2a: Write header + metadata + tensor info === */
     printf("=== Writing header... ===\n");
-    if (!write_header_and_metadata(out, src, out_types, out_sizes, n)) {
+    if (!write_header_and_metadata(out, src, out_types, out_sizes, out_offsets, n)) {
         fprintf(stderr, "Failed to write header\n");
         fclose(out); remove(output_path);
-        free(out_types); free(out_sizes);
+        free(out_types); free(out_sizes); free(out_offsets);
         ct_gguf_close(src);
         return 1;
     }
+    fflush(out);  /* flush header before threads start writing */
 
-    /* === PASS 2b: Stream-convert tensor data === */
-    printf("=== Streaming conversion (%d tensors) ===\n", n);
-    bool ok = true;
-    uint8_t zero_pad[32] = {0};
-    for (int i = 0; i < n && ok; i++) {
-        ok = stream_tensor(out, src, &src->tensors[i],
-                           dst_type, calibrate, format_name,
-                           i, n, preserve_sensitive);
-        if (ok) {
-            /* Pad to 32-byte alignment between tensors (GGUF v3 spec).
-             * The offsets in the tensor info section are 32-byte aligned,
-             * so the actual data must match. */
-            long pos = ftell(out);
-            long pad = (32 - (pos % 32)) % 32;
-            if (pad > 0)
-                fwrite(zero_pad, 1, (size_t)pad, out);
-        }
+    /* === PASS 2b: Parallel tensor conversion === */
+    long data_start = ftell(out);
+    printf("=== Parallel conversion (%d tensors, %d threads) ===\n", n, n > 4 ? 4 : n);
+
+    /* Determine thread count — use up to 4 threads for ARM big.LITTLE */
+    int n_threads = n < 4 ? n : 4;
+    if (n < n_threads) n_threads = n;
+
+    pthread_t threads[4];
+    worker_arg args[4];
+    volatile bool global_ok = true;
+
+    int chunk = (n + n_threads - 1) / n_threads;
+    for (int t = 0; t < n_threads; t++) {
+        args[t].thread_id = t;
+        args[t].tensor_start = t * chunk;
+        args[t].tensor_end = (t == n_threads - 1) ? n : (t + 1) * chunk;
+        args[t].src = src;
+        args[t].out_fd = out_fd;
+        args[t].data_start = (size_t)data_start;
+        args[t].out_offsets = out_offsets;
+        args[t].out_types = out_types;
+        args[t].dst_type = dst_type;
+        args[t].calibrate = calibrate;
+        args[t].format_name = format_name;
+        args[t].preserve_head = preserve_sensitive;
+        args[t].global_ok = &global_ok;
+        pthread_create(&threads[t], NULL, worker_convert, &args[t]);
     }
 
+    for (int t = 0; t < n_threads; t++)
+        pthread_join(threads[t], NULL);
+
+    bool ok = global_ok;
+
     /* Cleanup */
-    fclose(out);
+    fclose(out);  /* also closes out_fd via fdopen */
     free(out_types);
     free(out_sizes);
+    free(out_offsets);
     ct_gguf_close(src);
 
     if (ok) {
         printf("\n  ✅ Done! Output: %s (%.2f GB)\n",
                output_path, total_output / (1024.0*1024.0*1024.0));
+        if (verify) {
+            printf("\n=== Verification ===\n");
+            if (!verify_gguf(output_path))
+                return 1;
+        }
         return 0;
     } else {
         fprintf(stderr, "\n  ❌ Failed during conversion\n");

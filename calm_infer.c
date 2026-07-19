@@ -64,18 +64,29 @@ typedef struct {
     uint8_t  qs[16];/* Low 4 bits for 32 values */
 } ct_block_q5_0;
 
+/* Q4_1: 32 elements per block, FP16 scale + FP16 min + packed nibbles (unsigned) */
 typedef struct {
-    uint16_t d;       /* FP16 super-block scale */
-    uint16_t dmin;    /* FP16 super-block min */
-    uint8_t  scales[8];  /* Sub-block 6-bit scales */
+    uint16_t d;        /* FP16 scale */
+    uint16_t m;        /* FP16 min */
+    uint8_t  qs[16];   /* packed unsigned 4-bit nibbles (2 per byte) */
+} ct_block_q4_1;
+
+/* NOTE: struct layouts MUST match llama.cpp/GGUF file format exactly.
+ * Q4_K (type 12):  d(F16) + dmin(F16) + scales[12] + qs[128] = 144 bytes
+ * Q6_K (type 14):  ql[128] + qh[64] + scales[16](int8) + d(F16) = 210 bytes
+ */
+typedef struct {
+    uint16_t d;          /* FP16 super-block scale */
+    uint16_t dmin;       /* FP16 super-block min */
+    uint8_t  scales[12]; /* 12-byte 6-bit sub-block scales (Q4_K) */
     uint8_t  qs[128];    /* 4-bit quants for 256 values */
 } ct_block_q4_K;
 
 typedef struct {
-    uint16_t d;        /* FP16 super-block scale */
-    uint8_t  ql[128];  /* Lower 4 bits of quants */
-    uint8_t  qh[64];   /* Upper 2 bits of quants (packed) */
+    uint8_t  ql[128];  /* Lower 4 bits of quants (256×4bit=128bytes) */
+    uint8_t  qh[64];   /* Upper 2 bits of quants (256×2bit=64bytes) */
     int8_t   scales[16]; /* 8-bit sub-block scales */
+    uint16_t d;        /* FP16 super-block scale — MUST be last (llama.cpp layout) */
 } ct_block_q6_K;
 
 typedef struct {
@@ -94,18 +105,41 @@ static void deq_q5_0(const ct_block_q5_0* b, float* out) {
     }
 }
 
-/* Dequantize one Q4_K super-block of 256 values to float */
+/* Dequantize one Q4_1 block of 32 values to float (unsigned nibbles with min) */
+static void deq_q4_1(const ct_block_q4_1* b, float* out) {
+    float d = ct_fp16_to_fp32(b->d);
+    float m = ct_fp16_to_fp32(b->m);
+    for (int i = 0; i < 32; i++) {
+        int nib = (b->qs[i >> 1] >> ((i & 1) << 2)) & 0xF;
+        out[i] = (float)nib * d + m;
+    }
+}
+
+/* Dequantize one Q4_K super-block of 256 values to float
+ * Format (llama.cpp): d(F16,2B) + dmin(F16,2B) + scales[12B] + qs[128B] = 144B
+ * scales: 8 sub-blocks × 6-bit = 48 bits in bytes 0-5 (d-scales),
+ *         8 min-scales × 6-bit = 48 bits in bytes 6-11 (dmin-scales) */
 static void deq_q4_K(const ct_block_q4_K* b, float* out) {
     float d    = ct_fp16_to_fp32(b->d);
     float dmin = ct_fp16_to_fp32(b->dmin);
-    for (int j = 0; j < 256; j++) {
-        int iscale = j / 32;
-        int sc = (b->scales[iscale / 2] >> ((iscale & 1) << 2)) & 0xF;
-        sc = (sc & 8) ? (sc | 0xF0) : sc; /* sign-extend 4-bit */
-        float s  = d * sc;
-        float sm = dmin * (sc - 0x10);
-        int nib  = (b->qs[j >> 1] >> ((j & 1) << 2)) & 0xF;
-        out[j] = (float)nib * s + sm;
+    for (int sb = 0; sb < 8; sb++) {
+        /* Decode 6-bit scale from bytes 0-5 */
+        int sc_byte = (sb * 6) / 8;
+        int sc_bit  = (sb * 6) % 8;
+        int sc_val = (((unsigned)b->scales[sc_byte] >> sc_bit) |
+                      ((unsigned)b->scales[sc_byte + 1] << (8 - sc_bit))) & 0x3F;
+        /* Decode 6-bit minscale from bytes 6-11 */
+        int sc_byte2 = 6 + (sb * 6) / 8;
+        int sc_bit2  = (sb * 6) % 8;
+        int sc_mval = (((unsigned)b->scales[sc_byte2] >> sc_bit2) |
+                       ((unsigned)b->scales[sc_byte2 + 1] << (8 - sc_bit2))) & 0x3F;
+        float dl = d * ((float)sc_val - 16.0f);
+        float ml = dmin * ((float)sc_mval - 16.0f);
+        for (int j = 0; j < 32; j++) {
+            int idx = sb * 32 + j;
+            int nib = (b->qs[idx >> 1] >> ((idx & 1) << 2)) & 0xF;
+            out[idx] = (float)nib * dl + ml;
+        }
     }
 }
 
@@ -115,8 +149,7 @@ static void deq_q6_K(const ct_block_q6_K* b, float* out) {
     for (int j = 0; j < 256; j++) {
         int ql = (b->ql[j >> 1] >> ((j & 1) << 2)) & 0xF;
         int qh = (b->qh[j >> 2] >> ((j & 3) << 1)) & 3;
-        int val = ql | (qh << 4);
-        if (val > 63) val -= 128; /* sign-extend 7-bit */
+        int val = (ql | (qh << 4)) - 32; /* center 6-bit: -32..31 */
         int sc_idx = j / 16;
         out[j] = (float)val * (float)b->scales[sc_idx] * d;
     }
@@ -187,6 +220,21 @@ static void matmul_q8_K(float* y, const float* x, const ct_block_q8_K* w, int I,
     }
 }
 
+/* Q4_1 matmul: 32 elements per block, unsigned nibbles + scale + min */
+static void matmul_q4_1(float* y, const float* x, const ct_block_q4_1* w, int I, int O) {
+    float buf[32];
+    for (int o = 0; o < O; o++) {
+        float sum = 0.0f;
+        int base = o * I;
+        for (int b = 0; b < I / 32; b++) {
+            deq_q4_1(&w[base / 32 + b], buf);
+            for (int i = 0; i < 32; i++)
+                sum += x[b * 32 + i] * buf[i];
+        }
+        y[o] = sum;
+    }
+}
+
 /* ═══════════════════════════════════════════════════════════════
  * F16 matmul (scalar — dequantize on the fly)
  * ═══════════════════════════════════════════════════════════════ */
@@ -236,6 +284,9 @@ void matmul(float* y, const float* x, const void* w, int type, int I, int O) {
             break;
         case CT_GGUF_TYPE_Q4_0:
             ct_matmul_q4_0(y, x, (const ct_block_q4_0*)w, I, O);
+            break;
+        case CT_GGUF_TYPE_Q4_1:
+            matmul_q4_1(y, x, (const ct_block_q4_1*)w, I, O);
             break;
         case CT_GGUF_TYPE_BQ1_0:
             ct_matmul_bq1_0(y, x, (const ct_block_bq1_0*)w, I, O);
@@ -354,6 +405,13 @@ void embed_row(float* out, const void* table, int type,
                     out[b * 32 + i] = ((float)nib - 8.0f) * d;
                 }
             }
+            break;
+        }
+        case CT_GGUF_TYPE_Q4_1: {
+            const ct_block_q4_1* blocks = (const ct_block_q4_1*)row;
+            int nb = (n_embd + 31) / 32;
+            for (int b = 0; b < nb; b++)
+                deq_q4_1(&blocks[b], out + b * 32);
             break;
         }
         case CT_GGUF_TYPE_Q5_0: {
@@ -631,7 +689,7 @@ static int build_weights(ct_gguf_context* gguf, ct_infer_weights* w) {
                 fprintf(stderr, "infer: missing blk.%d.attn_q.weight\n", i);
                 return -1;
             }
-            if (i == 0) fprintf(stderr, "infer: blk.0.attn_q.weight type=%d\n", l->t_q);
+            if (i == 0) fprintf(stderr, "infer: blk.0.attn_q.weight type=%d (attn layer)\n", l->t_q);
             snprintf(name, sizeof(name), "blk.%d.attn_q.bias", i);
             l->attn_q_bias = (float*)find_tensor(gguf, name, &tmp_type);
             if (i == 0 && l->attn_q_bias) fprintf(stderr, "infer: attn_q.bias type=%d (layer 0)\n", tmp_type);
@@ -642,7 +700,7 @@ static int build_weights(ct_gguf_context* gguf, ct_infer_weights* w) {
                 fprintf(stderr, "infer: missing blk.%d.attn_k.weight\n", i);
                 return -1;
             }
-            if (i == 0) fprintf(stderr, "infer: blk.0.attn_k.weight type=%d\n", l->t_k);
+            if (i == 0) fprintf(stderr, "infer: blk.0.attn_k.weight type=%d (attn layer)\n", l->t_k);
             snprintf(name, sizeof(name), "blk.%d.attn_k.bias", i);
             l->attn_k_bias = (float*)find_tensor(gguf, name, &tmp_type);
 
@@ -652,7 +710,7 @@ static int build_weights(ct_gguf_context* gguf, ct_infer_weights* w) {
                 fprintf(stderr, "infer: missing blk.%d.attn_v.weight\n", i);
                 return -1;
             }
-            if (i == 0) fprintf(stderr, "infer: blk.0.attn_v.weight type=%d\n", l->t_v);
+            if (i == 0) fprintf(stderr, "infer: blk.0.attn_v.weight type=%d (attn layer)\n", l->t_v);
             snprintf(name, sizeof(name), "blk.%d.attn_v.bias", i);
             l->attn_v_bias = (float*)find_tensor(gguf, name, &tmp_type);
 
@@ -662,7 +720,7 @@ static int build_weights(ct_gguf_context* gguf, ct_infer_weights* w) {
                 fprintf(stderr, "infer: missing blk.%d.attn_output.weight\n", i);
                 return -1;
             }
-            if (i == 0) fprintf(stderr, "infer: blk.0.attn_output.weight type=%d\n", l->t_o);
+            if (i == 0) fprintf(stderr, "infer: blk.0.attn_output.weight type=%d (attn layer)\n", l->t_o);
         }
 
         snprintf(name, sizeof(name), "blk.%d.ffn_norm.weight", i);
@@ -705,41 +763,55 @@ static int build_weights(ct_gguf_context* gguf, ct_infer_weights* w) {
         if (i == 0 && l->ffn_down)
             fprintf(stderr, "infer: blk.0.ffn_down.weight type=%d\n", l->t_d);
 
-        /* MoE expert weights (if applicable) */
+        /* MoE expert weights (if applicable)
+         * Jamba uses n_expert=1 as convention for dense FFN (single expert = dense path).
+         * Check if expert tensors actually exist before entering MoE mode. */
         if (w->config.n_expert > 0) {
-            int ne = w->config.n_expert;
-            l->expert_gate = (void**)calloc((size_t)ne, sizeof(void*));
-            l->expert_up   = (void**)calloc((size_t)ne, sizeof(void*));
-            l->expert_down = (void**)calloc((size_t)ne, sizeof(void*));
-            l->t_eg = (int*)calloc((size_t)ne, sizeof(int));
-            l->t_eu = (int*)calloc((size_t)ne, sizeof(int));
-            l->t_ed = (int*)calloc((size_t)ne, sizeof(int));
-            if (!l->expert_gate || !l->expert_up || !l->expert_down ||
-                !l->t_eg || !l->t_eu || !l->t_ed) return -1;
+            char tmp[128];
+            snprintf(tmp, sizeof(tmp), "blk.%d.experts.%d.ffn_gate.weight", i, 0);
+            int tmp_t = 0;
+            const void* expert_tensor = find_tensor(gguf, tmp, &tmp_t);
+            if (!expert_tensor) {
+                /* No expert tensors — treat as dense (skip MoE for all layers) */
+                if (i == 0) fprintf(stderr, "infer: n_expert=%d but no expert tensors, treating as dense\n",
+                        w->config.n_expert);
+                w->config.n_expert = 0;  /* disable MoE for subsequent layers */
+            } else {
+                /* Real MoE — load expert tensors */
+                int ne = w->config.n_expert;
+                l->expert_gate = (void**)calloc((size_t)ne, sizeof(void*));
+                l->expert_up   = (void**)calloc((size_t)ne, sizeof(void*));
+                l->expert_down = (void**)calloc((size_t)ne, sizeof(void*));
+                l->t_eg = (int*)calloc((size_t)ne, sizeof(int));
+                l->t_eu = (int*)calloc((size_t)ne, sizeof(int));
+                l->t_ed = (int*)calloc((size_t)ne, sizeof(int));
+                if (!l->expert_gate || !l->expert_up || !l->expert_down ||
+                    !l->t_eg || !l->t_eu || !l->t_ed) return -1;
 
-            for (int e = 0; e < ne; e++) {
-                snprintf(name, sizeof(name), "blk.%d.experts.%d.ffn_gate.weight", i, e);
-                l->expert_gate[e] = (void*)find_tensor(gguf, name, &l->t_eg[e]);
-                if (!l->expert_gate[e]) {
-                    fprintf(stderr, "infer: missing %s\n", name);
-                    return -1;
+                for (int e = 0; e < ne; e++) {
+                    snprintf(name, sizeof(name), "blk.%d.experts.%d.ffn_gate.weight", i, e);
+                    l->expert_gate[e] = (void*)find_tensor(gguf, name, &l->t_eg[e]);
+                    if (!l->expert_gate[e]) {
+                        fprintf(stderr, "infer: missing %s\n", name);
+                        return -1;
+                    }
+                    snprintf(name, sizeof(name), "blk.%d.experts.%d.ffn_up.weight", i, e);
+                    l->expert_up[e] = (void*)find_tensor(gguf, name, &l->t_eu[e]);
+                    if (!l->expert_up[e]) {
+                        fprintf(stderr, "infer: missing %s\n", name);
+                        return -1;
+                    }
+                    snprintf(name, sizeof(name), "blk.%d.experts.%d.ffn_down.weight", i, e);
+                    l->expert_down[e] = (void*)find_tensor(gguf, name, &l->t_ed[e]);
+                    if (!l->expert_down[e]) {
+                        fprintf(stderr, "infer: missing %s\n", name);
+                        return -1;
+                    }
                 }
-                snprintf(name, sizeof(name), "blk.%d.experts.%d.ffn_up.weight", i, e);
-                l->expert_up[e] = (void*)find_tensor(gguf, name, &l->t_eu[e]);
-                if (!l->expert_up[e]) {
-                    fprintf(stderr, "infer: missing %s\n", name);
-                    return -1;
-                }
-                snprintf(name, sizeof(name), "blk.%d.experts.%d.ffn_down.weight", i, e);
-                l->expert_down[e] = (void*)find_tensor(gguf, name, &l->t_ed[e]);
-                if (!l->expert_down[e]) {
-                    fprintf(stderr, "infer: missing %s\n", name);
-                    return -1;
-                }
+                if (i == 0)
+                    fprintf(stderr, "infer: MoE with %d experts, top-%d per token\n",
+                            ne, w->config.n_expert_per_token);
             }
-            if (i == 0)
-                fprintf(stderr, "infer: MoE with %d experts, top-%d per token\n",
-                        ne, w->config.n_expert_per_token);
         }
     }
 
@@ -1008,7 +1080,28 @@ int ct_infer_forward(ct_infer_state* s, int pos,
             /* ── Attention sub-block ── */
 
             /* RMS norm (s->normed is dedicated — no aliasing with bufs) */
+            if (layer == 0 && pos <= 23) {
+                float h_sum = 0, h_min = 1e9, h_max = -1e9;
+                for (int j = 0; j < E; j++) {
+                    h_sum += h[j];
+                    if (h[j] < h_min) h_min = h[j];
+                    if (h[j] > h_max) h_max = h[j];
+                }
+                fprintf(stderr, "[DBG] L0 pos=%d BEFORE h: range=[%.4f,%.4f] sum=%.2f max_abs=%.2f\n",
+                        pos, h_min, h_max, h_sum, fmaxf(fabsf(h_min), fabsf(h_max)));
+            }
             rms_norm(s->normed, h, lw->attn_norm, E, cfg->norm_rms_eps);
+            if (layer == 0 && pos <= 23) {
+                float n_sum = 0, n_min = 1e9, n_max = -1e9;
+                for (int j = 0; j < E; j++) {
+                    n_sum += s->normed[j];
+                    if (s->normed[j] < n_min) n_min = s->normed[j];
+                    if (s->normed[j] > n_max) n_max = s->normed[j];
+                }
+                fprintf(stderr, "[DBG] L0 pos=%d AFTER rms_norm: range=[%.4f,%.4f] sum=%.2f max_abs=%.2f first4=[%.4f,%.4f,%.4f,%.4f]\n",
+                        pos, n_min, n_max, n_sum, fmaxf(fabsf(n_min), fabsf(n_max)),
+                        s->normed[0], s->normed[1], s->normed[2], s->normed[3]);
+            }
 
             /* Batch: Q, K, V all from the same normed input (skip Vulkan for layers beyond gpu_layers) */
 #ifdef CT_VULKAN
@@ -1017,6 +1110,17 @@ int ct_infer_forward(ct_infer_state* s, int pos,
 #endif
             __asm__ volatile("" ::: "memory");
             matmul(s->buf_q, s->normed, lw->attn_q, lw->t_q, E, H * HD);
+            if (layer == 0 && pos <= 23) {
+                float q_sum = 0, q_min = 1e9, q_max = -1e9;
+                for (int j = 0; j < H*HD; j++) {
+                    q_sum += s->buf_q[j];
+                    if (s->buf_q[j] < q_min) q_min = s->buf_q[j];
+                    if (s->buf_q[j] > q_max) q_max = s->buf_q[j];
+                }
+                fprintf(stderr, "[DBG] L0 pos=%d Q: range=[%.4f,%.4f] sum=%.2f first4=[%.4f,%.4f,%.4f,%.4f]\n",
+                        pos, q_min, q_max, q_sum,
+                        s->buf_q[0], s->buf_q[1], s->buf_q[2], s->buf_q[3]);
+            }
             __asm__ volatile("" ::: "memory");
             matmul(s->buf_k, s->normed, lw->attn_k, lw->t_k, E, HK * HD);
             __asm__ volatile("" ::: "memory");
@@ -1103,6 +1207,16 @@ int ct_infer_forward(ct_infer_state* s, int pos,
 #endif
             for (int i = 0; i < E; i++)
                 h[i] += s->ffbuf[i];
+            if (layer == 0 && pos <= 23) {
+                float h_sum = 0, h_min = 1e9, h_max = -1e9;
+                for (int j = 0; j < E; j++) {
+                    h_sum += h[j];
+                    if (h[j] < h_min) h_min = h[j];
+                    if (h[j] > h_max) h_max = h[j];
+                }
+                fprintf(stderr, "[DBG] L0 pos=%d AFTER attn: range=[%.4f,%.4f] sum=%.2f max_abs=%.2f\n",
+                        pos, h_min, h_max, h_sum, fmaxf(fabsf(h_min), fabsf(h_max)));
+            }
         }
 
         /* ── FFN sub-block ── */
@@ -1186,6 +1300,46 @@ int ct_infer_forward(ct_infer_state* s, int pos,
             if (use_vk) ct_vulkan_batch_end(g_vk);
 #endif
 
+            /* ── FFN internal debug (layer 0 only) ── */
+            if (layer == 0 && pos <= 2) {
+                float g_max=-1e9, g_min=1e9, u_max=-1e9, u_min=1e9;
+                float g_abs_sum=0, u_abs_sum=0;
+                for (int i = 0; i < cfg->n_ff; i++) {
+                    if (s->ffbuf[i] < g_min) g_min = s->ffbuf[i];
+                    if (s->ffbuf[i] > g_max) g_max = s->ffbuf[i];
+                    if (s->buf_k[i] < u_min) u_min = s->buf_k[i];
+                    if (s->buf_k[i] > u_max) u_max = s->buf_k[i];
+                    g_abs_sum += fabsf(s->ffbuf[i]);
+                    u_abs_sum += fabsf(s->buf_k[i]);
+                }
+                fprintf(stderr, "[DBG] L%d pos=%d FFN gate raw range=[%.4f,%.4f] abs_sum=%.2f up range=[%.4f,%.4f] abs_sum=%.2f\n",
+                        layer, pos, g_min, g_max, g_abs_sum, u_min, u_max, u_abs_sum);
+                /* Dump some Q4_0 block scales from ffn_gate */
+                if (lw->t_g == CT_GGUF_TYPE_Q4_0) {
+                    int blk_per_I = (E + 31) / 32;
+                    fprintf(stderr, "[DBG] L%d ffn_gate first 16 scales (row 0, blk 0-15):", layer);
+                    const ct_block_q4_0* w = (const ct_block_q4_0*)lw->ffn_gate;
+                    for (int bi = 0; bi < 16 && bi < blk_per_I; bi++)
+                        fprintf(stderr, " %.6f", ct_fp16_to_fp32(w[bi].d));
+                    fprintf(stderr, "\n");
+                    /* Also dump row 0 output[0] computed with FP32 reference */
+                    float ref = 0;
+                    for (int bi = 0; bi < blk_per_I; bi++) {
+                        float d = ct_fp16_to_fp32(w[bi].d);
+                        for (int k = 0; k < 16; k++) {
+                            float v0 = (float)((int8_t)(w[bi].qs[k] & 0x0F) - 8) * d;
+                            float v1 = (float)((int8_t)(w[bi].qs[k] >> 4) - 8) * d;
+                            int ii0 = bi * 32 + k * 2;
+                            int ii1 = bi * 32 + k * 2 + 1;
+                            if (ii0 < E) ref += s->normed[ii0] * v0;
+                            if (ii1 < E) ref += s->normed[ii1] * v1;
+                        }
+                    }
+                    fprintf(stderr, "[DBG] L%d pos=%d FFN gate[0] NEON=%.6f FP32_ref=%.6f diff=%.6f\n",
+                            layer, pos, s->ffbuf[0], ref, s->ffbuf[0] - ref);
+                }
+            }
+
             /* SiLU gate output in-place */
             for (int i = 0; i < cfg->n_ff; i++)
                 s->ffbuf[i] = silu(s->ffbuf[i]);
@@ -1194,16 +1348,58 @@ int ct_infer_forward(ct_infer_state* s, int pos,
             for (int i = 0; i < cfg->n_ff; i++)
                 s->ffbuf[i] *= s->buf_k[i];
 
+            /* ── FFN internal debug (layer 0) after gated product ── */
+            if (layer == 0 && pos <= 2) {
+                float p_max=0, p_min=1e9, p_sum=0, p_abs_sum=0;
+                for (int i = 0; i < cfg->n_ff; i++) {
+                    if (s->ffbuf[i] < p_min) p_min = s->ffbuf[i];
+                    if (s->ffbuf[i] > p_max) p_max = s->ffbuf[i];
+                    p_sum += s->ffbuf[i];
+                    p_abs_sum += fabsf(s->ffbuf[i]);
+                }
+                fprintf(stderr, "[DBG] L%d pos=%d FFN gate*up range=[%.4f,%.4f] sum=%.2f abs_sum=%.2f\n",
+                        layer, pos, p_min, p_max, p_sum, p_abs_sum);
+            }
+
             /* Down: buf_v[E] = (gate*up) @ Wdown */
 #ifdef CT_VULKAN
             if (use_vk) ct_vulkan_batch_begin(g_vk);
 #endif
             matmul(s->buf_v, s->ffbuf, lw->ffn_down, lw->t_d, cfg->n_ff, E);
+
+            /* ── FFN internal debug (layer 0) down output ── */
+            if (layer == 0 && pos <= 2) {
+                float d_max=0, d_min=1e9, d_sum=0, d_abs_sum=0;
+                for (int i = 0; i < E; i++) {
+                    if (s->buf_v[i] < d_min) d_min = s->buf_v[i];
+                    if (s->buf_v[i] > d_max) d_max = s->buf_v[i];
+                    d_sum += s->buf_v[i];
+                    d_abs_sum += fabsf(s->buf_v[i]);
+                }
+                fprintf(stderr, "[DBG] L%d pos=%d FFN down range=[%.4f,%.4f] sum=%.2f abs_sum=%.2f max_abs=%.4f\n",
+                        layer, pos, d_min, d_max, d_sum, d_abs_sum, fmaxf(fabsf(d_min), fabsf(d_max)));
+            }
 #ifdef CT_VULKAN
             if (use_vk) ct_vulkan_batch_end(g_vk);
 #endif
             for (int i = 0; i < E; i++)
                 h[i] += s->buf_v[i];
+
+            /* Per-layer hidden state debug */
+            {
+                float h_abs_sum = 0, h_max_abs = 0;
+                float h_max_idx = -1, h_min = 1e9, h_max = -1e9;
+                for (int i = 0; i < E; i++) {
+                    float av = fabsf(h[i]);
+                    h_abs_sum += av;
+                    if (av > h_max_abs) { h_max_abs = av; h_max_idx = i; }
+                    if (h[i] < h_min) h_min = h[i];
+                    if (h[i] > h_max) h_max = h[i];
+                }
+                fprintf(stderr, "[DBG] L%d pos=%d h: sum|abs|=%f range=[%f,%f] max_abs=%f at idx=%.0f buf_v[idx]=%f\n",
+                        layer, pos, h_abs_sum, h_min, h_max, h_max_abs, h_max_idx,
+                        (h_max_idx >= 0 && h_max_idx < E) ? s->buf_v[(int)h_max_idx] : 0.0f);
+            }
         }
     }
 
@@ -1344,8 +1540,42 @@ int ct_infer_generate(ct_infer_state* s,
     float* layer_out = s->buf_q; /* reuse — working buffer */
     for (int i = 0; i < n_prompt; i++) {
         embed_row(s->hidden, s->w.token_embd, s->w.t_embd, tokens[i], E);
+        /* Debug: check ALL token embeddings */
+        {
+            float max_e = -1e9, min_e = 1e9, sum_e = 0;
+            for (int j = 0; j < E; j++) {
+                if (s->hidden[j] > max_e) max_e = s->hidden[j];
+                if (s->hidden[j] < min_e) min_e = s->hidden[j];
+                sum_e += s->hidden[j];
+            }
+            float e_ss = 0;
+            for (int j = 0; j < E; j++) e_ss += s->hidden[j] * s->hidden[j];
+            fprintf(stderr, "[DBG] token[%d]=%d emb range=[%.4f,%.4f] avg=%.4f rms=%.4f max_abs=%.4f\n",
+                    i, tokens[i], min_e, max_e, sum_e / E, sqrtf(e_ss/E), fmaxf(fabsf(min_e), fabsf(max_e)));
+        }
         if (ct_infer_forward(s, i, s->hidden, layer_out) != 0)
             return -1;
+        /* Debug: check hidden state for each position */
+        {
+            float s_h = 0, m_h = 0;
+            for (int j = 0; j < E; j++) {
+                s_h += layer_out[j];
+                if (fabsf(layer_out[j]) > m_h) m_h = fabsf(layer_out[j]);
+            }
+            fprintf(stderr, "[DBG] pos=%d hidden: sum=%.2f max_abs=%.2f first4=[%.4f,%.4f,%.4f,%.4f]\n",
+                    i, s_h, m_h, layer_out[0], layer_out[1], layer_out[2], layer_out[3]);
+        }
+        /* Debug: check last prefill hidden state */
+        if (i == n_prompt - 1) {
+            float max_h = -1e9, min_h = 1e9, sum_h = 0;
+            for (int j = 0; j < E; j++) {
+                if (layer_out[j] > max_h) max_h = layer_out[j];
+                if (layer_out[j] < min_h) min_h = layer_out[j];
+                sum_h += layer_out[j];
+            }
+            fprintf(stderr, "[DBG] after prefill hidden_out range=[%.4f,%.4f] avg=%.4f\n",
+                    min_h, max_h, sum_h / E);
+        }
     }
 
     int total = n_prompt;
@@ -1354,6 +1584,17 @@ int ct_infer_generate(ct_infer_state* s,
 
     /* Generation loop */
     for (int gen = 0; gen < max_gen; gen++) {
+        /* Debug: hidden state before final RMS norm */
+        if (gen == 0) {
+            float h_min=1e9, h_max=-1e9, h_ss=0;
+            for (int i=0; i<E; i++) {
+                if (layer_out[i] < h_min) h_min = layer_out[i];
+                if (layer_out[i] > h_max) h_max = layer_out[i];
+                h_ss += layer_out[i] * layer_out[i];
+            }
+            fprintf(stderr, "[DBG] pre-norm h: range=[%.4f,%.4f] rms=%.4f\n",
+                    h_min, h_max, sqrtf(h_ss/E));
+        }
         /* Final RMS norm (into normed buffer to avoid aliasing matmul) */
         rms_norm(s->normed, layer_out, s->w.final_norm, E, cfg->norm_rms_eps);
 
@@ -1365,6 +1606,19 @@ int ct_infer_generate(ct_infer_state* s,
             /* Weight tying: use token_embd */
             matmul(s->logits, s->normed, s->w.token_embd,
                    s->w.t_embd, E, cfg->n_vocab);
+        }
+        /* Debug: verify logit[128000] = normed · embed_row(128000) */
+        if (gen == 0 && s->w.t_embd == 14) {
+            float emb_bos[256];
+            float dot_manual = 0.0f;
+            for (int b = 0; b < E/256; b++) {
+                const ct_block_q6_K* blk = (const ct_block_q6_K*)s->w.token_embd + 128000 * (E/256) + b;
+                deq_q6_K(blk, emb_bos);
+                for (int i = 0; i < 256; i++)
+                    dot_manual += s->normed[b*256 + i] * emb_bos[i];
+            }
+            fprintf(stderr, "[DBG] logit[128000]=%.4f manual_dot=%.4f\n",
+                    s->logits[128000], dot_manual);
         }
 
         /* Apply repeat penalty */
@@ -1380,6 +1634,120 @@ int ct_infer_generate(ct_infer_state* s,
                         s->logits[tid] *= repeat_penalty;
                 }
             }
+        }
+
+        /* Debug: check normed state before final matmul (gen==0 only) */
+        if (gen == 0) {
+            float n_min = 1e9, n_max = -1e9, n_sum = 0, n_ss = 0;
+            for (int i = 0; i < E && i < 200000; i++) {
+                if (s->normed[i] < n_min) n_min = s->normed[i];
+                if (s->normed[i] > n_max) n_max = s->normed[i];
+                n_sum += s->normed[i];
+                n_ss += s->normed[i] * s->normed[i];
+            }
+            fprintf(stderr, "[DBG] normed: range=[%.4f, %.4f] sum=%.4f rms=%.4f first8=[",
+                    n_min, n_max, n_sum, sqrtf(n_ss / E));
+            for (int i = 0; i < 8 && i < E; i++)
+                fprintf(stderr, "%s%.4f", i?",":"", s->normed[i]);
+            fprintf(stderr, "]\n");
+        }
+
+        /* Debug: print top-5 logits + specific token logits on first gen step */
+        if (gen == 0) {
+            int top5[5] = {-1,-1,-1,-1,-1};
+            float top5v[5] = {-1e9,-1e9,-1e9,-1e9,-1e9};
+            for (int i = 0; i < cfg->n_vocab && i < 200000; i++) {
+                float v = s->logits[i];
+                for (int k = 0; k < 5; k++) {
+                    if (v > top5v[k]) {
+                        for (int kk = 4; kk > k; kk--) {
+                            top5[kk] = top5[kk-1];
+                            top5v[kk] = top5v[kk-1];
+                        }
+                        top5[k] = i;
+                        top5v[k] = v;
+                        break;
+                    }
+                }
+            }
+            fprintf(stderr, "[DBG] gen=0 top-5 logits:");
+            for (int k = 0; k < 5; k++) {
+                fprintf(stderr, " %d:%.2f", top5[k], top5v[k]);
+            }
+            /* Find max and min logit */
+            float max_l = -1e9, min_l = 1e9;
+            for (int i = 0; i < cfg->n_vocab && i < 200000; i++) {
+                if (s->logits[i] > max_l) max_l = s->logits[i];
+                if (s->logits[i] < min_l) min_l = s->logits[i];
+            }
+            /* Compute logit stats */
+            float l_sum = 0, l_ss = 0;
+            for (int i = 0; i < cfg->n_vocab && i < 200000; i++) {
+                l_sum += s->logits[i];
+                l_ss += s->logits[i] * s->logits[i];
+            }
+            int nv = (cfg->n_vocab < 200000 ? cfg->n_vocab : 200000);
+            /* Check specific tokens */
+            int check_tokens[] = {12095, 151643, 151645, 151644, 1, 20843, 785, 128000, 128001, 128006, 128007, 128009};
+            fprintf(stderr, "  range=[%.2f, %.2f] mean=%.4f rms=%.4f", min_l, max_l, l_sum/nv, sqrtf(l_ss/nv));
+            for (int c = 0; c < sizeof(check_tokens)/sizeof(int); c++) {
+                int tid = check_tokens[c];
+                if (tid >= 0 && tid < cfg->n_vocab)
+                    fprintf(stderr, " tok%d:%.2f", tid, s->logits[tid]);
+            }
+            /* Decode top-5 token texts */
+            for (int k = 0; k < 5; k++) {
+                const char* ts = ct_gguf_vocab_get(s->gguf, top5[k]);
+                fprintf(stderr, " top%d='%s'", k, ts ? ts : "?");
+            }
+            /* Check output_norm weights if gen==0 */
+            if (s->w.final_norm) {
+                fprintf(stderr, " norm_w=[%.4f,%.4f,%.4f,%.4f,%.4f]",
+                        s->w.final_norm[0], s->w.final_norm[1],
+                        s->w.final_norm[2], s->w.final_norm[3],
+                        s->w.final_norm[4]);
+            }
+            /* Dequantize first 4 elements of rows 20843 and 12095 */
+            if (s->w.t_embd == 8) {
+                int embed_n = 896;
+                uint8_t* wdata = (uint8_t*)s->w.token_embd;
+                int bpr = embed_n / 32;
+                for (int ridx = 0; ridx < 2; ridx++) {
+                    int cr[] = {20843, 12095};
+                    int r = cr[ridx];
+                    uint8_t* row = wdata + (int64_t)r * bpr * CT_SIZEOF_Q8_0;
+                    fprintf(stderr, " dq_r%d=[", r);
+                    for (int e = 0; e < 4 && e < embed_n; e++) {
+                        int bidx = e / 32;
+                        int eidx = e % 32;
+                        ct_block_q8_0* blk = (ct_block_q8_0*)(row + bidx * CT_SIZEOF_Q8_0);
+                        _Float16 d_half = *(_Float16*)&blk->d;
+                        float d = (float)d_half;
+                        float val = d * blk->qs[eidx];
+                        fprintf(stderr, "%s%.6f", e?",":"", val);
+                    }
+                    fprintf(stderr, "]");
+                }
+            }
+            /* Check Q8_0 d-values for token_embd rows */
+            if (s->w.t_embd == 8) { /* Q8_0: struct{uint16_t d; int8_t qs[32];} */
+                int embed_n = 896;
+                uint8_t* wdata = (uint8_t*)s->w.token_embd;
+                int blocks_per_row = embed_n / 32; /* =28 */
+                for (int ridx = 0; ridx < 3; ridx++) {
+                    int check_rows[] = {20843, 12095, 0};
+                    int r = check_rows[ridx];
+                    uint8_t* row = wdata + (int64_t)r * blocks_per_row * CT_SIZEOF_Q8_0;
+                    for (int b = 0; b < 3 && b < blocks_per_row; b++) {
+                        /* d is at offset 0 within each 34-byte block */
+                        uint16_t d_raw = *(uint16_t*)(row + b * CT_SIZEOF_Q8_0);
+                        _Float16 d_half = *(_Float16*)&d_raw;
+                        float d = (float)d_half;
+                        fprintf(stderr, " r%db%d=%.8f", r, b, d);
+                    }
+                }
+            }
+            fprintf(stderr, "\n");
         }
 
         /* Sample next token */

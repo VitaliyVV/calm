@@ -1,7 +1,7 @@
 # Calm — Universal Local LLM Runtime
 
 **Дорожная карта продукта**
-**Дата:** 17 июля 2026 (обновлено 17 июля 2026, 20:30 UTC)
+**Дата:** 19 июля 2026 (обновлено 19 июля 2026, 09:00 UTC)
 **Версия:** v0.3 (C engine + Vulkan + auto-config + Bonsai-format kernels)
 
 ---
@@ -57,7 +57,7 @@ Qwythos-9B — **не** стандартный dense transformer, а **Jamba-sty
 |---|-------------|--------|--------|
 | 🔵 1 | **Qwen2/Qwen2.5 dense** | ✅ **Работает** | Парсинг GGUF, dequant fallback (Q5_0/Q6_K), BPE токенизатор, forward pass, генерация |
 | 🟡 2 | **SSM hybrid (Qwen3.5/Jamba)** | ❌ **SSM не реализован** | ~600 строк — selective scan, fused QKV, conv1d, layer dispatch. **Нужен для:** Qwythos-9B, Ornith-9B, Qwen3.5 hybrid |
-| 🟢 3 | **GGUF→GGUF Requantizer** | ◐ **Dequant есть, mmap streaming нет** | calm_convert.c умеет dequant Q4_K → BQ1_0/TQ1_0, но загружает всё в RAM. Нужен mmap streaming для моделей >3 GB |
+| 🟢 3 | **GGUF→GGUF Requantizer** | ✅ **Streaming + parallel + verify** | calm_convert.c: mmap streaming, row-by-row dequant→requant, 4-thread parallel, PTQ calibration, --verify, Q8_0→TQ1_0 (0.5B) tested |
 | 🟣 4 | **Bonsai (Qwen3.6, 1-bit)** | ◐ **Форматы есть, рантайма нет** | BQ1_0/TQ1_0 quant ядра есть, но инференс Qwen3.6 не реализован (зависит от направления 2)
 
 ### Реальность на телефоне
@@ -225,30 +225,38 @@ calm convert --input qwen3.6-27b-fp16 --output ternary-2bit --format tq1_0
 
 ---
 
-## Фаза 6: GGUF→GGUF Requantizer ◐ (streaming done)
+## Фаза 6: GGUF→GGUF Requantizer ✅
 
 **Цель:** Стабильная утилита для пережатия любых существующих GGUF моделей (Q4_K_M, Q5_0, Q8_0, Q6_K, FP16, FP32) в BQ1_0/TQ1_0 формат без перезагрузки с HuggingFace. Прямой путь сжать Qwythos-9B-Q4_K_M (5.6 GB) → TQ1_0 (~1.7 GB) для запуска на телефоне.
 
 ### Компоненты
 - [x] **mmap-based streaming**: row-by-row dequant → requant, пиковая RAM = 1 строка float (~2 MB для 9B). Подтверждено: qwen2.5-0.5b (380 MB, 290 тензоров) сконвертирован без OOM
 - [x] **Sensitive layer preservation** (Q8_0): token_embd.weight, output.weight — сохраняются в Q8_0
-- [x] **Dequant типов**: F32, F16, Q8_0, Q4_0, Q4_1, **Q5_0**, **Q5_1**, **Q2_K**, **Q4_K**, **Q5_K**, **Q6_K**
-- [ ] **Dequant типов (недостающие)**: Q3_K (stub), Q8_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_XS, IQ3_S, IQ4_NL, IQ4_XS
-- [ ] **PTQ calibration**: `--calibrate` флаг интеграция (MSE-optimal threshold для TQ1_0)
-- [ ] **Параллельная обработка**: requant нескольких тензоров одновременно (worker threads)
-- [ ] **Верификация**: флаг `--verify` — прочитать output GGUF, проверить целостность
+- [x] **Dequant типов**: F32, F16, Q8_0, Q4_0, Q4_1, **Q5_0**, **Q5_1**, **Q2_K**, **Q4_K**, **Q5_K**, **Q6_K**, **Q3_K**, **Q8_K**
+- [ ] **Dequant типов (недостающие)**: IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_XS, IQ3_S, IQ4_NL, IQ4_XS (редко встречаются)
+- [x] **PTQ calibration**: `--calibrate` флаг — MSE-optimal threshold sweep для TQ1_0 (без калибровочного датасета)
+- [x] **Параллельная обработка**: 4 worker thread, pwrite в предвычисленные offset'ы, output идентичен sequential
+- [x] **Верификация**: флаг `--verify` — mmap output GGUF, проверка offset+size каждого тензора ≤ file_size
 
 ### Технические детали
 - ✅ **Streaming loop реализован**: 2 прохода — Pass 1 вычисляет размеры, Pass 2 stream-конвертит
-- ✅ **Проверено на qwen2.5-0.5b** (Q5_0+Q6_K → TQ1_0, 380 MB → 230 MB)
-- ✅ **Выходной GGUF загружается calm-движком**: tensor types правильно распознаны (type=65 = TQ1_0)
-- ⚠️ Q3_K dequant — заглушка (zeroes out, но не крешит)
+- ✅ **Параллельный Pass 2**: 4 потока, chunk-based разделение тензоров, pwrite в выходной fd
+- ✅ **Проверено на qwen2.5-0.5b** — чистый Q8_0 скачан с HuggingFace (676 MB), сконвертирован в TQ1_0 (376 MB) и BQ1_0 (343 MB), verify пройден
+- ✅ **Выходной GGUF загружается calm-движком**: `calm analyze` читает, tensor types корректны
+- ✅ **Q3_K dequant — полностью реализован** (не заглушка): 2 группы K3 с весом по 6 бит, суперблок 16 весов
+- ✅ **Q8_K dequant — полностью реализован**: 8-bit блоки с min/max scaling
 - ⚠️ IQ форматы не реализованы (редко встречаются в GGUF)
 
 ### Время выполнения
-- ◐ **Streaming core:** ~4 часа (реализовано)
-- ◐ **Dequant типов:** ~2 часа (основные сделаны, IQ форматы остались)
-- 🔜 **PTQ + parallel:** ~1-2 дня
+- ✅ **Streaming core:** ~4 часа (реализовано)
+- ✅ **Dequant типов:** ~3 часа (все основные типы, включая Q3_K, Q8_K)
+- ✅ **PTQ + parallel + verify:** ~4 часа (реализовано, протестировано на реальной модели)
+
+### Добавлено в Phase 6
+- `--verify` флаг: проверяет целостность output GGUF после конвертации
+- Параллельная конвертация: 4 worker thread (ARM big.LITTLE), chunk-based
+- Загрузка чистой модели Q8_0 (676 MB) с HuggingFace для тестирования
+- Bounds check в `stream_tensor()`: детекция обрезанных входных GGUF файлов
 
 ---
 
@@ -353,14 +361,14 @@ total params: ~15.7B
 Фаза 3: GPU backends             │ ██████░░░░░░░░░░  4-8 нед    ◐ Vulkan + hybrid
 Фаза 4: Auto-config + smart      │ ████████████░░░░  1-2 нед    ✅ core done
 Фаза 5: Production release       │ ░░░░░░░░░░░░░░░░  4-8 нед
-Фаза 6: GGUF↔GGUF Requantizer    │ ████████░░░░░░░░  1-2 нед    ◐ streaming done
+Фаза 6: GGUF↔GGUF Requantizer    │ ████████████████  1-2 нед    ✅ done (streaming + parallel + verify)
 Фаза 7: SSM Forward Pass         │ ░░░░░░░░░░░░░░░░  2-3 нед    🔜
 Фаза 8: DeepSeek2 (MLA+MoE)      │ ░░░░░░░░░░░░░░░░  2-3 нед    🔜
                                      └── ~5-10 месяцев всего
 ```
 
 **Ключевые вехи:**
-- Phase 6 → сжатие любых GGUF в TQ1_0/BQ1_0 через mmap streaming (prerequisite для всего)
+- ✅ Phase 6 → сжатие любых GGUF в TQ1_0/BQ1_0 через mmap streaming (prerequisite для всего)
 - Phase 7 → **Ornith-9B**, Qwythos-9B, Qwen3.5-9B на телефоне (SSM гибриды)
 - Phase 8 → **DeepSeek-Coder-V2-Lite 16B** на телефоне (MLA + MoE, 2.3 GB BQ1_0)
 - Phase 7 + 8 → два top-tier кодер-движка на телефоне: Qwen3.5-based и DeepSeek-V2-based
@@ -379,7 +387,7 @@ total params: ~15.7B
 8. ✅ **BPE токенайзер** — работает для GPT-2/tiktoken моделей (Qwen2, Qwen2.5)
 9. ✅ **BQ1_0/TQ1_0 quant ядра** — с NEON оптимизацией
 10. ✅ **GGUF→TQ1_0/BQ1_0 конвертер** — `calm_convert.c`
-11. ◐ **Phase 6: GGUF→GGUF Requantizer** — streaming core ✅, dequant F32/F16/Q8_0/Q4_0/Q4_1/Q5_0/Q5_1/Q2_K/Q4_K/Q5_K/Q6_K ✅, остались IQ форматы
+11. ✅ **Phase 6: GGUF→GGUF Requantizer** — streaming ✅, dequant F32/F16/Q8_0/Q4_0/Q4_1/Q5_0/Q5_1/Q2_K/Q4_K/Q5_K/Q6_K/Q3_K/Q8_K ✅, PTQ calibration ✅, parallel 4-thread ✅, --verify ✅, IQ форматы остались (редкие)
 12. ✅ **Phase 7: SSM Forward Pass** — Mamba-style selective scan для Qwen3.5/Jamba/Ornith гибридов
 13. 🔄 **Phase 8: DeepSeek2 (MLA+MoE)** — Multi-head Latent Attention + DeepSeekMoE для DeepSeek-Coder-V2
 14. 📦 **mmap/expert streaming** — Colibri-style, холодные эксперты с диска
@@ -620,6 +628,20 @@ Transformer+SSM архитектур (Jamba, Ornith, Qwythos, Qwen3.5 SSM).
 **Причина:** `write_header_and_metadata()` вычислял смещения тензоров с 32-байтовым выравниванием, но `stream_tensor()` писал данные последовательно без паддингов. При некратном 32 размере тензора смещения в tensor info не совпадали с реальными позициями → неверные указатели на данные тензоров.
 
 **Фикс:** `calm_convert.c` — после каждого тензора добавляется padding до 32 байт.
+
+### 4. Bounds check в `stream_tensor()` — детекция обрезанных GGUF
+
+**Причина:** При конвертации обрезанного GGUF (tensor offset + size > mmap size) `stream_tensor()` читала данные за границей mmap → SIGBUS (crash) или мусорные данные без ошибки.
+
+**Симптомы на qwen2.5-0.5b:** Все 3 локальные GGUF файла (Q8_0=433MB, Q4_0=296MB, TQ1_0=323MB) оказались обрезанными — tensor_data_offset=5947744 совпадал, но файлы были на 14–56% меньше ожидаемого размера.
+
+**Фикс:** `calm_convert.c` — добавлена проверка `(const uint8_t*)src_row + src_stride > (const uint8_t*)src->data + src->size` перед каждым чтением строки, с понятным сообщением об ошибке (`tensor 'X' row Y exceeds mmap`).
+
+### 5. `--verify` — mmap output файла мог крешиться на /dev/null
+
+**Причина:** `verify_gguf()` вызывал `open()` + `mmap()` на выходной файл. Если выходной путь — `/dev/null` (нуль-тест), mmap возвращал MAP_FAILED.
+
+**Фикс:** `verify_gguf()` корректно обрабатывает MAP_FAILED и выводит сообщение об ошибке.
 
 ### 3. `is_head_tensor()` — ложное срабатывание на `attn_output.weight`
 

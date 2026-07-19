@@ -596,14 +596,38 @@ ct_tokenizer* ct_tokenizer_load(ct_gguf_context* gguf) {
             }
         } else {
             /* Skip value — use our standard parser path.
-             * But since we're re-parsing, we need to skip.
-             * For anything that's not an array, skip by type. */
+             * But since we're re-parsing, we need to skip all types. */
             switch (vtype) {
                 case 0: case 1: pos += 1; break;
                 case 2: case 3: pos += 2; break;
                 case 4: case 5: case 6: pos += 4; break;
                 case 7: pos += 1; break;
                 case 8: { uint64_t sl; memcpy(&sl, data + pos, 8); pos += 8 + sl; break; }
+                case 9: {
+                    /* ARRAY: read arr_type + arr_len, then skip elements */
+                    if (pos + 12 > file_size) break;
+                    uint32_t arr_type = *(const uint32_t*)(data + pos);
+                    uint64_t arr_len = *(const uint64_t*)(data + pos + 4);
+                    pos += 12;
+                    for (uint64_t j = 0; j < arr_len && pos < file_size; j++) {
+                        if (arr_type == 8) { /* STRING array */
+                            if (pos + 8 > file_size) break;
+                            uint64_t slen = *(const uint64_t*)(data + pos);
+                            pos += 8;
+                            if (slen > file_size - pos) break;
+                            pos += (size_t)slen;
+                        } else if (arr_type == 4 || arr_type == 5 || arr_type == 6) {
+                            pos += 4;
+                        } else if (arr_type == 2 || arr_type == 3) {
+                            pos += 2;
+                        } else if (arr_type == 0 || arr_type == 1 || arr_type == 7) {
+                            pos += 1;
+                        } else {
+                            pos += 4;
+                        }
+                    }
+                    break;
+                }
                 case 10: case 11: case 12: pos += 8; break;
                 default: pos += 4; break;
             }
@@ -611,87 +635,89 @@ ct_tokenizer* ct_tokenizer_load(ct_gguf_context* gguf) {
     }
 
     if (!found_tokens || !tok->tokens) {
-        fprintf(stderr, "tokenizer: no tokenizer.ggml.tokens array found\n");
-        goto fail;
+        /* Fallback: use vocab already loaded by ct_gguf_open */
+        if (gguf->vocab.tokens && gguf->vocab.n_vocab > 0) {
+            tok->vocab_size = gguf->vocab.n_vocab;
+            tok->tokens = calloc((size_t)gguf->vocab.n_vocab, sizeof(char*));
+            tok->token_lens = calloc((size_t)gguf->vocab.n_vocab, sizeof(int));
+            if (tok->tokens && tok->token_lens) {
+                for (int i = 0; i < gguf->vocab.n_vocab; i++) {
+                    if (gguf->vocab.tokens[i]) {
+                        tok->tokens[i] = strdup(gguf->vocab.tokens[i]);
+                        tok->token_lens[i] = (int)strlen(gguf->vocab.tokens[i]);
+                    }
+                }
+                found_tokens = 1;
+            }
+        }
+        if (!found_tokens) {
+            fprintf(stderr, "tokenizer: no tokenizer.ggml.tokens array found\n");
+            goto fail;
+        }
     }
 
-    /* Build byte-to-token lookup (GPT-2 byte encoding scheme).
+    /* Build byte-to-token lookup from actual vocab.
      *
-     * GPT-2 maps each byte 0x00-0xFF to a Unicode codepoint:
-     *   - 0x21-0x7E (printable ASCII): map to themselves
-     *   - 0x00-0x20: map to U+0100..U+0120 (33 codepoints)
-     *   - 0x7F-0xFF: map to U+0121..U+01A1 (129 codepoints)
+     * Scans the first min(256, vocab_size) tokens and decodes each
+     * to determine which byte it represents. Handles both GPT-2 and
+     * Llama byte encoding schemes automatically:
      *
-     * For each byte, we build the expected UTF-8 string and scan
-     * the full vocab for a matching token.
+     *   GPT-2: 0x00-0x20 → U+0100-U+0120    (cp - 0x0100)
+     *          0x21-0x7E → direct             (cp as-is)
+     *          0x7F-0xFF → U+0121-U+01A1     (cp - 0x00A2)
+     *
+     *   Llama: 0x00-0x20 → U+0100-U+0120    (same as GPT-2)
+     *          0x21-0x7E → direct             (same as GPT-2)
+     *          0x7F-0xA1 → U+0121-U+0143     (cp - 0x00A2)
+     *          0xA2-0xFF → U+00A2-U+00FF     (cp as-is, identity)
      */
-    static const uint16_t byte_to_cp[256] = {
-        /* 0x00-0x20 → U+0100..U+0120 */
-        0x0100,0x0101,0x0102,0x0103,0x0104,0x0105,0x0106,0x0107,
-        0x0108,0x0109,0x010A,0x010B,0x010C,0x010D,0x010E,0x010F,
-        0x0110,0x0111,0x0112,0x0113,0x0114,0x0115,0x0116,0x0117,
-        0x0118,0x0119,0x011A,0x011B,0x011C,0x011D,0x011E,0x011F,
-        0x0120,  /* 0x20 = space → U+0120 'Ġ' */
-        /* 0x21-0x7E → map to themselves */
-        0x0021,0x0022,0x0023,0x0024,0x0025,0x0026,0x0027,0x0028,
-        0x0029,0x002A,0x002B,0x002C,0x002D,0x002E,0x002F,0x0030,
-        0x0031,0x0032,0x0033,0x0034,0x0035,0x0036,0x0037,0x0038,
-        0x0039,0x003A,0x003B,0x003C,0x003D,0x003E,0x003F,0x0040,
-        0x0041,0x0042,0x0043,0x0044,0x0045,0x0046,0x0047,0x0048,
-        0x0049,0x004A,0x004B,0x004C,0x004D,0x004E,0x004F,0x0050,
-        0x0051,0x0052,0x0053,0x0054,0x0055,0x0056,0x0057,0x0058,
-        0x0059,0x005A,0x005B,0x005C,0x005D,0x005E,0x005F,0x0060,
-        0x0061,0x0062,0x0063,0x0064,0x0065,0x0066,0x0067,0x0068,
-        0x0069,0x006A,0x006B,0x006C,0x006D,0x006E,0x006F,0x0070,
-        0x0071,0x0072,0x0073,0x0074,0x0075,0x0076,0x0077,0x0078,
-        0x0079,0x007A,0x007B,0x007C,0x007D,0x007E,
-        /* 0x7F-0xFF → U+0121..U+01A1 */
-        0x0121,0x0122,0x0123,0x0124,0x0125,0x0126,0x0127,0x0128,
-        0x0129,0x012A,0x012B,0x012C,0x012D,0x012E,0x012F,0x0130,
-        0x0131,0x0132,0x0133,0x0134,0x0135,0x0136,0x0137,0x0138,
-        0x0139,0x013A,0x013B,0x013C,0x013D,0x013E,0x013F,0x0140,
-        0x0141,0x0142,0x0143,0x0144,0x0145,0x0146,0x0147,0x0148,
-        0x0149,0x014A,0x014B,0x014C,0x014D,0x014E,0x014F,0x0150,
-        0x0151,0x0152,0x0153,0x0154,0x0155,0x0156,0x0157,0x0158,
-        0x0159,0x015A,0x015B,0x015C,0x015D,0x015E,0x015F,0x0160,
-        0x0161,0x0162,0x0163,0x0164,0x0165,0x0166,0x0167,0x0168,
-        0x0169,0x016A,0x016B,0x016C,0x016D,0x016E,0x016F,0x0170,
-        0x0171,0x0172,0x0173,0x0174,0x0175,0x0176,0x0177,0x0178,
-        0x0179,0x017A,0x017B,0x017C,0x017D,0x017E,0x017F,0x0180,
-        0x0181,0x0182,0x0183,0x0184,0x0185,0x0186,0x0187,0x0188,
-        0x0189,0x018A,0x018B,0x018C,0x018D,0x018E,0x018F,0x0190,
-        0x0191,0x0192,0x0193,0x0194,0x0195,0x0196,0x0197,0x0198,
-        0x0199,0x019A,0x019B,0x019C,0x019D,0x019E,0x019F,0x01A0,
-        0x01A1,
-    };
-
     for (int b = 0; b < 256; b++)
         tok->byte_to_token[b] = -1;
 
-    /* Encode each byte's codepoint as UTF-8 and scan vocab */
-    for (int b = 0; b < 256; b++) {
-        unsigned cp = byte_to_cp[b];
-        uint8_t utf8[8];
-        int utf8_len;
-        if (cp < 0x80) {
-            utf8[0] = (uint8_t)cp;
-            utf8_len = 1;
-        } else if (cp < 0x800) {
-            utf8[0] = 0xC0 | (cp >> 6);
-            utf8[1] = 0x80 | (cp & 0x3F);
-            utf8_len = 2;
-        } else {
-            utf8[0] = 0xE0 | (cp >> 12);
-            utf8[1] = 0x80 | ((cp >> 6) & 0x3F);
-            utf8[2] = 0x80 | (cp & 0x3F);
-            utf8_len = 3;
+    int n_byte_tokens = tok->vocab_size < 256 ? tok->vocab_size : 256;
+    for (int v = 0; v < n_byte_tokens; v++) {
+        if (tok->token_lens[v] <= 0) continue;
+
+        /* Decode the token string as UTF-8 */
+        int ulen;
+        unsigned cp = utf8_decode(tok->tokens[v], &ulen);
+        if (ulen != tok->token_lens[v]) continue;  /* multi-codepoint? skip */
+
+        int byte_val = -1;
+        if (cp >= 0x21 && cp <= 0x7E && ulen == 1) {
+            byte_val = cp;                                     /* direct ASCII */
+        } else if (cp >= 0x100 && cp <= 0x120 && ulen == 2) {
+            byte_val = (int)(cp - 0x0100);                     /* bytes 0x00-0x20 */
+        } else if (cp >= 0x121 && cp <= 0x1A1 && ulen == 2) {
+            byte_val = (int)(cp - 0x00A2);                     /* bytes 0x7F-0xFF */
+        } else if (cp >= 0xA1 && cp <= 0xFF && ulen == 2) {
+            byte_val = (int)cp;                                /* Llama identity */
+        } else if (cp < 0x21 && ulen == 1) {
+            byte_val = (int)cp;                                /* raw control byte */
         }
-        for (int v = 0; v < tok->vocab_size; v++) {
-            if (tok->token_lens[v] == utf8_len &&
-                memcmp(tok->tokens[v], utf8, (size_t)utf8_len) == 0) {
-                tok->byte_to_token[b] = v;
-                break;
-            }
+
+        if (byte_val >= 0 && byte_val < 256)
+            tok->byte_to_token[byte_val] = v;
+    }
+
+    /* ── Discover special tokens from vocab ──
+     * Scan for tokens matching <|...|> and store for use during encode.
+     * These must be emitted as single tokens, not split by BPE. */
+    tok->specials = NULL;
+    tok->n_specials = 0;
+    for (int v = 0; v < tok->vocab_size; v++) {
+        if (tok->token_lens[v] <= 0) continue;
+        const char* s = tok->tokens[v];
+        int slen = tok->token_lens[v];
+        /* Match <|...|> pattern with len >= 5 (<||> min) */
+        if (slen >= 5 && s[0] == '<' && s[1] == '|' && s[slen-2] == '|' && s[slen-1] == '>') {
+            void* p = realloc(tok->specials, sizeof(*tok->specials) * (size_t)(tok->n_specials + 1));
+            if (!p) continue;
+            tok->specials = p;
+            tok->specials[tok->n_specials].str = strndup(s, (size_t)slen);
+            tok->specials[tok->n_specials].id  = v;
+            tok->specials[tok->n_specials].len = slen;
+            tok->n_specials++;
         }
     }
 
@@ -730,25 +756,20 @@ int ct_tokenizer_encode(ct_tokenizer* tok, const char* text,
     /* ── Special token scanning ──
      * Scan the input for known special token strings before pre-tokenization.
      * These tokens must be emitted as single token IDs, not split by BPE.
-     * Format: { string_literal, token_id }
-     * This list should be populated from GGUF metadata ideally, but for now
-     * we hardcode the common Qwen2 special tokens. */
-    int n_special = 3;
-    struct { const char* str; int id; } specials[] = {
-        {"<|im_start|>", 151644},
-        {"<|im_end|>", 151645},
-        {"<|endoftext|>", 151643},
-    };
+     * Special token list is populated from vocab during tokenizer load
+     * (tokens matching <|...|> pattern, e.g. Llama <|start_header_id|>,
+     * Qwen <|im_start|>, etc.). */
+    int n_special = tok->n_specials;
 
     int pos = 0;
     while (pos < text_len && total < max_tokens) {
         /* Check for special token match at current position */
         int matched = 0;
         for (int s = 0; s < n_special; s++) {
-            int slen = (int)strlen(specials[s].str);
+            int slen = tok->specials[s].len;
             if (pos + slen <= text_len &&
-                memcmp(text + pos, specials[s].str, (size_t)slen) == 0) {
-                tokens[total++] = specials[s].id;
+                memcmp(text + pos, tok->specials[s].str, (size_t)slen) == 0) {
+                tokens[total++] = tok->specials[s].id;
                 pos += slen;
                 matched = 1;
                 break;
@@ -761,9 +782,9 @@ int ct_tokenizer_encode(ct_tokenizer* tok, const char* text,
         while (pos < text_len) {
             int is_special = 0;
             for (int s = 0; s < n_special; s++) {
-                int slen = (int)strlen(specials[s].str);
+                int slen = tok->specials[s].len;
                 if (pos + slen <= text_len &&
-                    memcmp(text + pos, specials[s].str, (size_t)slen) == 0) {
+                    memcmp(text + pos, tok->specials[s].str, (size_t)slen) == 0) {
                     is_special = 1;
                     break;
                 }
@@ -849,6 +870,24 @@ static void gpt2_decode_bytes(char* text, size_t* len) {
             }
         }
 
+        /* Llama-style byte encoding: two-byte 0xC2-0xC3 + 0x80-0xBF
+         * Bytes 0xA2-0xFF → codepoints U+00A2-U+00FF (identity mapping)
+         * The UTF-8 of these codepoints starts with 0xC2-0xC3, which is
+         * outside the GPT-2 0xC4-0xC7 range checked above.
+         * Output the decoded codepoint as a single byte (identity).
+         * This is SAFE for GPT-2 models too — 0xC2-0xC3 never appears
+         * in GPT-2 byte-encoded token strings. */
+        if (c >= 0xC2 && c <= 0xC3 && r + 1 < *len) {
+            unsigned char c2 = (unsigned char)text[r + 1];
+            if (c2 >= 0x80 && c2 <= 0xBF) {
+                unsigned cp = ((unsigned)(c & 0x1F) << 6) | (unsigned)(c2 & 0x3F);
+                /* Identity mapping: cp == byte value for 0x80-0xFF */
+                text[w++] = (unsigned char)cp;
+                r += 2;
+                continue;
+            }
+        }
+
         /* Any remaining byte: NUL, or something unexpected.
          * Replace NUL with space to avoid truncation, pass others through. */
         text[w++] = c == '\0' ? ' ' : c;
@@ -930,5 +969,10 @@ void ct_tokenizer_free(ct_tokenizer* tok) {
     free(tok->scores);
     free(tok->merges);
     free(tok->merge_order);
+    if (tok->specials) {
+        for (int i = 0; i < tok->n_specials; i++)
+            free(tok->specials[i].str);
+        free(tok->specials);
+    }
     free(tok);
 }

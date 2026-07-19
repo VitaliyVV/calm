@@ -29,7 +29,35 @@ make
 - **HTTP API** — OpenAI-compatible `/v1/completions`. POSIX socket server, thread-per-request, zero HTTP dependencies.
 - **Function/tool calling** — Qwen2.5 `<|tool_call|>` format. Built-in tools: `get_current_time`, `get_weather`, `search`, `calculator`. Custom tools via JSON config.
 - **Quantized inference** — FP32, Q4_0, Q8_0, BQ1_0 (binary), TQ1_0 (ternary) via NEON SIMD on ARM.
-- **Model conversion** — Convert FP32/Q8_0 GGUF to BQ1_0/TQ1_0 format for memory-constrained devices.
+- **Model conversion** — `calm_convert` converts any GGUF (Q8_0, Q4_0, Q4_K, Q5_K, Q6_K, Q3_K, etc.) to BQ1_0 (binary) or TQ1_0 (ternary) format via mmap streaming. **No full-tensor buffer needed** — peak RAM = 1 float row (~2 MB for 9B models). Features: `--calibrate` (MSE-optimal ternary thresholds), `--verify` (post-conversion integrity check), **4-thread parallel processing**.
+
+## Model Converter (calm_convert)
+
+`calm_convert` is a standalone GGUF→GGUF requantizer with zero full-tensor RAM overhead. It stream-converts any GGUF to BQ1_0 (binary 1.125-bit) or TQ1_0 (ternary 1.58-bit) format for running 9B+ models on memory-constrained devices.
+
+```bash
+# Convert Q8_0 → TQ1_0 (ternary, 1.58-bit)
+./calm_convert --input model-q8_0.gguf --format tq1_0 --output model-tq1_0.gguf
+
+# Convert with MSE-optimal calibration (better quality)
+./calm_convert --input model.gguf --format tq1_0 --output model.gguf --calibrate
+
+# Verify output integrity after conversion
+./calm_convert --input model.gguf --format tq1_0 --output model.gguf --verify
+
+# Full pipeline: calibrate + verify + parallel
+./calm_convert --input model.gguf --format bq1_0 --output model-bq1_0.gguf --calibrate --verify
+```
+
+**Key features:**
+- **mmap streaming**: row-by-row dequant → requant, peak RAM ≈ 1 row float
+- **Parallel processing**: 4 worker threads via pwrite to pre-computed offsets
+- **PTQ calibration**: MSE-optimal ternary threshold sweep (no dataset needed)
+- **Post-conversion verify**: opens output GGUF, validates all tensor offsets
+- **Sensitive layer preservation**: token_embd.weight, output.weight stay in Q8_0
+- **Supported input types**: F32, F16, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K
+
+**Tested on real model**: Qwen2.5-0.5B-Instruct Q8_0 (676 MB) → TQ1_0 (376 MB) / BQ1_0 (343 MB). Output verified and loads correctly in `calm analyze`.
 
 ## Supported Architectures
 
@@ -50,6 +78,7 @@ calm run      <model.gguf>          Run interactive inference
 calm serve    <model.gguf>          Start HTTP API server
 calm analyze  <model.gguf>          Display model architecture info
 calm tokenize <model.gguf> <text>   Tokenize text and show tokens
+calm convert  <model.gguf> <fmt>    Convert GGUF to TQ1_0/BQ1_0 (via calm_convert)
 
 Flags for `run`:
   --temp FLOAT         Sampling temperature (default: 0.0)
