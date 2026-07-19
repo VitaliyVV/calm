@@ -1,8 +1,8 @@
 # Calm — Universal Local LLM Runtime
 
 **Дорожная карта продукта**
-**Дата:** 19 июля 2026 (обновлено 19 июля 2026, 09:00 UTC)
-**Версия:** v0.3 (C engine + Vulkan + auto-config + Bonsai-format kernels)
+**Дата:** 19 июля 2026 (обновлено 19 июля 2026)
+**Версия:** v0.4 (SSM forward pass + debug cleanup + matmul audit)
 
 ---
 
@@ -265,21 +265,21 @@ calm convert --input qwen3.6-27b-fp16 --output ternary-2bit --format tq1_0
 **Цель:** Добавить Mamba-style Selective Scan (SSM) для поддержки гибридных архитектур. Это откроет: Qwythos-9B (24 SSM + 8 attention слоёв), Qwen3.5-9B, Qwen3.6-27B (Bonsai), Ornith-9B.
 
 ### Компоненты
-- [ ] **SSM selective scan ядро** (Mamba-style, O(L) time):
+- [x] **SSM selective scan ядро** (Mamba-style, O(L) time):
   - Depthwise 1D convolution с SiLU активацией (conv1d)
   - Discretization: Δ → Ā, B̄
   - Scan loop: h[t] = Ā·h[t-1] + B̄·x[t] (все FP32)
   - Обработка 24 SSM слоёв за проход
-- [ ] **Fused QKV поддержка для SSM слоёв**:
+- [x] **Fused QKV поддержка для SSM слоёв**:
   - `attn_qkv.weight` → split на Q, K, V
   - SSM-специфичные веса: `sm_conv1d`, `sm_alpha`, `sm_beta`, `sm_out`, `sm_a`, `sm_dt`
-- [ ] **Layer-type dispatch из GGUF metadata**:
+- [x] **Layer-type dispatch из GGUF metadata**:
   - Qwythos: слои 3,7,11,15,19,23,27,31 → attention; остальные 24 → SSM
   - Определять по наличию `ssm_conv1d` vs `attn_q.weight` в GGUF
   - Generic: читать из metadata ключ типа `qwen35.layer_type.{i}`
-- [ ] **QK-RoPE norms** для SSM attention слоёв
-- [ ] **Поддержка в `build_weights()`**: загрузка SSM тензоров по именам
-- [ ] **Поддержка в `ct_infer_forward()`**: per-layer выбор attention vs SSM
+- [x] **QK-RoPE norms** для SSM attention слоёв
+- [x] **Поддержка в `build_weights()`**: загрузка SSM тензоров по именам
+- [x] **Поддержка в `ct_infer_forward()`**: per-layer выбор attention vs SSM
 
 ### Архитектура Qwythos-9B (32 слоя, Jamba-style)
 ```
@@ -389,9 +389,11 @@ total params: ~15.7B
 10. ✅ **GGUF→TQ1_0/BQ1_0 конвертер** — `calm_convert.c`
 11. ✅ **Phase 6: GGUF→GGUF Requantizer** — streaming ✅, dequant F32/F16/Q8_0/Q4_0/Q4_1/Q5_0/Q5_1/Q2_K/Q4_K/Q5_K/Q6_K/Q3_K/Q8_K ✅, PTQ calibration ✅, parallel 4-thread ✅, --verify ✅, IQ форматы остались (редкие)
 12. ✅ **Phase 7: SSM Forward Pass** — Mamba-style selective scan для Qwen3.5/Jamba/Ornith гибридов
-13. 🔄 **Phase 8: DeepSeek2 (MLA+MoE)** — Multi-head Latent Attention + DeepSeekMoE для DeepSeek-Coder-V2
-14. 📦 **mmap/expert streaming** — Colibri-style, холодные эксперты с диска
-15. 📦 **Qwen3.6 архитектура** — для запуска Bonsai-27B (1-bit, 3.9 GB) — зависит от Phase 7
+13. ✅ **Debug cleanup** — удалены все `[DBG]` fprintf из `calm_infer.c` (5 блоков, ~170 строк)
+14. ✅ **Matmul layout audit** — все 18 matmul вариантов проверены на правильность `[O,I]` GGUF layout'а
+15. 🔄 **Phase 8: DeepSeek2 (MLA+MoE)** — Multi-head Latent Attention + DeepSeekMoE для DeepSeek-Coder-V2
+16. 📦 **mmap/expert streaming** — Colibri-style, холодные эксперты с диска
+17. 📦 **Qwen3.6 архитектура** — для запуска Bonsai-27B (1-bit, 3.9 GB) — зависит от Phase 7
 
 ---
 
