@@ -1,0 +1,15 @@
+# Model files (too large for git)
+*.gguf
+
+# Build artifacts
+*.o
+*.o.*
+calm
+calm-cpu
+calm-vk
+calm_convert
+calm_server_test
+
+# Temp
+*.tmp
+*.swp
