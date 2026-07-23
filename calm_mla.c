@@ -215,6 +215,7 @@ extern void deq_q4_1(const void* b, float* out);
 extern void deq_q6_K(const void* b, float* out);
 extern void deq_q8_K(const void* b, float* out);
 extern void deq_iq4_nl(const void* b, float* out);
+extern void deq_bq1_0(const void* b, float* out);
 
 /* ── General path: absorption-based with per-row dequant for quantized Wkv_b ── */
 static void mla_forward_general(float* buf_q, const float* normed,
@@ -254,6 +255,7 @@ static void mla_forward_general(float* buf_q, const float* normed,
         case CT_GGUF_TYPE_Q4_1: deq_fn = deq_q4_1; break;
         case CT_GGUF_TYPE_Q6_K: deq_fn = deq_q6_K; break;
         case CT_GGUF_TYPE_Q8_K: deq_fn = deq_q8_K; break;
+        case CT_GGUF_TYPE_BQ1_0: deq_fn = deq_bq1_0; break;
         default: fprintf(stderr, "[MLA] unsupported Wkv_b type %d\n", lw->t_kvb); break;
     }
 

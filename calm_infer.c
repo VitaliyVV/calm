@@ -399,6 +399,13 @@ void matmul(float* y, const float* x, const void* w, int type, int I, int O) {
     }
 }
 
+/* BQ1_0 dequant: 2 groups × 128 → 256 floats (for MLA block size CT_QK_K=256) */
+void deq_bq1_0(const void* b, float* out) {
+    const ct_block_bq1_0* blocks = (const ct_block_bq1_0*)b;
+    ct_dequant_bq1_0(&blocks[0], out, CT_BQ1_0_GROUP_SIZE);
+    ct_dequant_bq1_0(&blocks[1], out + CT_BQ1_0_GROUP_SIZE, CT_BQ1_0_GROUP_SIZE);
+}
+
 /* ═══════════════════════════════════════════════════════════════
  * RMS Normalization: y[i] = x[i] * rsqrt(mean(x^2) + eps) * w[i]
  * ═══════════════════════════════════════════════════════════════ */
