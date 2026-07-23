@@ -13,3 +13,6 @@ calm_server_test
 # Temp
 *.tmp
 *.swp
+
+# Diagnostics
+dump_meta
