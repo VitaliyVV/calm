@@ -1,9 +1,9 @@
 # Calm — Universal Local LLM Runtime
 
 **Дорожная карта продукта**
-**Дата:** 23 июля 2026
-**Версия:** v0.3 — Qwythos NaN debug + DeepSeek MLA test phase
-**Контрольная точка:** git tag `v0.1-baseline` — Qwen2.5-0.5B Q8_0 работает, SSM+MLA интегрированы
+**Дата:** 23 июля 2026 (вечер)
+**Версия:** v0.4 — DeepSeek MLA fix + BQ1_0 support
+**Контрольная точка:** git tag `v0.3-mla-head-dim-fix` — MLA head_dim fix, DeepSeek BQ1_0 грузится и инферит
 
 ---
 
@@ -20,19 +20,21 @@ swap:   7.4 GiB свободно
 ```
 ~/calm/                                      Размер  Статус
   Qwythos-9B-BQ1_0.gguf                      3.0 GB  ◐ NaN в forward pass
-  DeepSeek-Coder-V2-Lite-Instruct.Q2_K.gguf   1.2 GB  ◐ не тестирован (MLA)
-  qwen2.5-0.5b-instruct-q8_0.gguf            645 MB  ✅ работает
+  DeepSeek-Coder-V2-Lite-Instruct.Q2_K.gguf   6.0 GB  ✅ скачан полный
+  DeepSeek-Coder-V2-Lite-Instruct.BQ1_0.gguf  578 MB  ◐ BQ1_0: грузится, MLA работает, CPU медленно
+  qwen2.5-0.5b-instruct-q8_0.gguf            645 MB  ✅ работает (сервер на 8082)
   qwen2.5-0.5b-instruct-bq1_0.gguf           328 MB  ✅ работает
   qwen2.5-0.5b-instruct-tq1_0-v3.gguf        359 MB  ✅ работает
   qwen2.5-0.5b-instruct-q4_0.gguf            283 MB  ✅ работает
 ```
 
-### Приоритет сейчас — две модели
+### Приоритет сейчас
 
 | # | Модель | Блокер | Что делать |
 |---|--------|--------|------------|
 | 🔴 1 | **Qwythos-9B BQ1_0** (3.0 GB) | NaN в `ct_forward_ssm_qwythos()` | Дебаг SSM → починить → запустить |
-| 🔵 2 | **DeepSeek-Coder-V2-Lite Q2_K** (1.2 GB) | MLA никогда не тестирован | Запустить → проверить → починить баги |
+| 🔵 2 | **DeepSeek-Coder-V2-Lite BQ1_0** (578 MB) | CPU inference ~1 tok/min — однопоточный | Починить многопоточность или Vulkan шейдеры для BQ1_0 |
+| 🔵 3 | **DeepSeek-Coder-V2-Lite Q2_K** (6.0 GB) | Не тестирован на инференс (не хватает RAM?) | Запустить → проверить → сравнить скорость с BQ1_0 |
 
 ---
 
@@ -375,19 +377,23 @@ total params: ~15.7B
 - Calm MoE core: уже есть ✅ — router + expert dispatch
 - KV cache: уже есть ✅ — но MLA требует меньший cache (преимущество)
 
-### Статус: ◐ В разработке (18 июля 2026)
+### Статус: ◐ BQ1_0 MLA работает (23 июля 2026 вечер)
 
 **Реализовано:**
 - `calm_mla.h` / `calm_mla.c` — MLA forward pass с absorption trick (Q_nope @ Wk_b → absorbed_q, weighted latent sum → V)
 - `calm_infer.h` — MLA config поля (kv_lora_rank, q_lora_rank, qk_nope_head_dim, qk_rope_head_dim, v_head_dim, n_shared_expert), MLA weights (attn_q_a/b, attn_kv_a/b, norm), MLA KV cache (mla_kv_cache)
 - `calm_infer.c` — MLA детекция через `attn_kv_a.weight`, weight loading, KV cache alloc, dispatch в forward pass
 - Shared expert (DeepSeekMoE) — weight loading + FFN forward поверх routed MoE
+- ✅ **BQ1_0 Wkv_b dequant** — добавлен `deq_bq1_0` (2× ct_block_bq1_0 → 256 float) + case CT_GGUF_TYPE_BQ1_0 в MLA switch
+- ✅ **DeepSeek-Coder-V2-Lite-Instruct скачан полным** — 6,430,464,448 bytes (6.0 GB), QuantFactory/... репозиторий
+- ✅ **Сконвертирован в BQ1_0** — 605 MB (578 MiB), работает
+- ✅ **MLA head_dim fix** — head_dim = mla_qk_nope_head_dim + mla_qk_rope_head_dim, не n_embd/n_head
 
 **Осталось:**
-- Тестирование на реальной DeepSeek2 GGUF модели (DS-Coder-V2-Lite-Instruct)
-- Поддержка quantized Wkv_b в MLA absorption loops (сейчас F32 fallback)
+- 🐢 **Ускорение inference**: однопоточный CPU, ~1 tok/min. Решения: (1) многопоточность NEON, (2) Vulkan шейдеры для BQ1_0, (3) использовать Q2_K на CPU
 - DeepSeek2 BPE tokenizer (специальные токены)
 - DeepSeerMoE fine-grained (64 experts, top-6) — существующий MoE роутер должен работать
+- Тест Q2_K напрямую (6 GB — возможно не хватит RAM, нужен mmap или BQ1_0)
 
 ### Новые файлы (~250 строк)
 - `calm_mla.h` — декларация `ct_forward_mla()`
@@ -432,7 +438,7 @@ total params: ~15.7B
 11. ◐ **Phase 6: GGUF→GGUF Requantizer** — streaming core ✅, dequant F32/F16/Q8_0/Q4_0/Q4_1/Q5_0/Q5_1/Q2_K/Q4_K/Q5_K/Q6_K ✅, остались IQ форматы
 12. ✅ **Phase 7: SSM Forward Pass (Mamba1)** — Mamba-style selective scan для Qwen3.5/Jamba/Ornith гибридов (+ calm_ssm.c/h, build_weights, layer dispatch)
 13. ◐ **Phase 7b: Qwythos SSM variant** — qwen35 fused-QKV SSM (builds + loads, NaN в forward pass)
-14. ◐ **Phase 8: DeepSeek2 (MLA+MoE)** — Multi-head Latent Attention + DeepSeekMoE (forward pass integrated: calm_mla.c, calm_infer.h/c, shared expert, absorption trick)
+14. ✅ **Phase 8: DeepSeek2 (MLA+MoE)** — Multi-head Latent Attention + DeepSeekMoE. BQ1_0 dequant для Wkv_b добавлен (deq_bq1_0). DeepSeek-Coder-V2-Lite BQ1_0 (578 MB) грузится, MLA forward pass работает на CPU. Inference медленный (однопоточный).
 15. 📦 **mmap/expert streaming** — Colibri-style, холодные эксперты с диска
 16. 📦 **Qwen3.6 архитектура** — для запуска Bonsai-27B (1-bit, 3.9 GB) — зависит от Phase 7 (ждёт фикса NaN в Qwythos variant)
 
@@ -728,26 +734,105 @@ NEON-оптимизация selective scan (особенно expf-вызовы �
 
 ---
 
-## 🧪 Phase 9: DeepSeek MLA — Test & Fix (добавлено 23 июля 2026)
+## 🧪 Phase 9: DeepSeek MLA — Test & Fix (добавлено 23 июля 2026, вечер)
 
-**Цель:** Запустить DeepSeek-Coder-V2-Lite-Instruct.Q2_K.gguf (1.2 GB, уже на диске) через calm-cpu, проверить MLA forward pass.
+**Цель:** Запустить DeepSeek-Coder-V2-Lite-Instruct на телефоне через calm.
 
 ### Статус
-- `calm_mla.c` — реализован MLA forward pass с absorption trick
-- `calm_infer.c` — детекция MLA через `attn_kv_a.weight`, загрузка весов, KV cache alloc
-- Shared expert (DeepSeekMoE) — загрузка + FFN forward поверх routed MoE
-- **Ни разу не тестировалось** — не было подходящей GGUF модели
+- ✅ **Q2_K скачан полный** (6.0 GB) — предыдущий 1.2 GB был битым (обрезан)
+- ✅ **Сконвертирован в BQ1_0** (578 MB) через calm_convert
+- ✅ **MLA BQ1_0 fix** — deq_bq1_0 wrapper + switch case
+- ✅ **MLA head_dim fix** — закоммичен (v0.3-mla-head-dim-fix)
+- ◐ **BQ1_0 inference**: модель грузится, MLA работает без ошибок, но CPU inference ~1 tok/min
+- ◐ **Причина медлительности**: однопоточный CPU, 27 слоёв × MLA + MoE (64 эксперта, 6 активных), 16B параметров (2.4B активных) даже в BQ1_0 дают ~2 GB данных на каждый токен
+- ❌ **Vulkan BQ1_0**: не поддерживается — нет compute шейдеров для BQ1_0 типа (только Q8_0)
 
-### План тестирования
-1. `calm-cpu analyze DeepSeek-Coder-V2-Lite-Instruct.Q2_K.gguf` — проверить метаданные
-2. `calm-cpu run DeepSeek-Coder-V2-Lite-Instruct.Q2_K.gguf --max-tokens 10` — тест генерации
-3. Если падает/NaN — дебаг аналогично Qwythos
-4. Известные проблемы MLA: quantization поддержка Wkv_b в absorption loops (сейчас F32 fallback), DeepSeek2 tokenizer (BPE спецтокены)
+### План ускорения
+1. Многопоточность CPU: `ct_matmul_bq1_0()` уже NEON-оптимизирован, но однопоточен. Разделить по строкам/экспертам
+2. Vulkan шейдеры для BQ1_0: новый compute shader для binary matmul (битовая операция + FP16 group scale)
+3. Q2_K напрямую: MLA Q2_K работает в `mla_forward_general()` (есть deq_q2_K). 6 GB может не хватить RAM
+4. Expert prefetch: загружать холодных экспертов с диска асинхронно
+
+### Известные проблемы
+- CPU inference однопоточный (нет `#pragma omp` или ручного threading)
+- BQ1_0 Vulkan не реализован
+- DeepSeek2 BPE tokenizer (специальные токены `惜`, `<｜end▁of▁sentence｜>`) — используются через llama.cpp tokenizer
 
 ### Размеры
 | Файл | Размер | RAM |
 |------|--------|-----|
-| DeepSeek-Coder-V2-Lite-Instruct.Q2_K.gguf | 1.2 GB | ✅ влезает с запасом |
+| DeepSeek-Coder-V2-Lite-Instruct.Q2_K.gguf | 6.0 GB | ⚠️ на грани (6 GB + KV cache) |
+| DeepSeek-Coder-V2-Lite-Instruct.BQ1_0.gguf | 578 MB | ✅ влезает с запасом |
+
+---
+
+## 🚀 DeepSeek Acceleration Plan (24 июля 2026)
+
+**Цель:** Ускорить DeepSeek-Coder-V2-Lite BQ1_0 (578 MB, 16B MoE) до приемлемой скорости на телефоне и подготовить путь для полноценной работы на ноутбуке.
+
+### Разделение платформ
+
+| Платформа | CPU | GPU | RAM | Стратегия |
+|-----------|-----|-----|-----|-----------|
+| 📱 **Смартфон** (Snapdragon 8+ Gen 1) | Cortex X2 + A710 + A510 | Adreno 730 | ~3.4 GB + 7 GB swap | BQ1_0, многопоточный CPU, Vulkan BQ1_0 шейдеры |
+| 💻 **Ноутбук** (будущее) | x86_64 multi-core | NVIDIA/Intel/AMD | 16+ GB | Q8_0, Vulkan/CUDA matmul на GPU |
+
+---
+
+### 📱 Смартфон — ближайшие задачи
+
+#### 1. Vulkan compute shader для BQ1_0 matmul
+
+**Почему:** Сейчас все matmul для BQ1_0 идут через CPU (`ct_matmul_bq1_0`). Adreno 730 простаивает. Vulkan шейдер для бинарного {−1,+1} matmul с FP16 group scaling даст ускорение в 3-10× на операциях матричного умножения.
+
+**Что нужно сделать:**
+- Написать GLSL compute shader для BQ1_0: каждая группа 128 весов → 2× uint64 (биты) + FP16 scale
+- Шейдер распаковывает биты: `weight[i] = (bit_i) ? +scale : -scale` → FP16 аккумуляция
+- Регистрация в `calm_vulkan.c`: `CT_VULKAN_WEIGHT_BQ1_0`, шейдерный модуль, push constants
+- Интеграция: `ct_vulkan_matmul_bq1_0()` вызывается из `matmul()` в calm_infer.c
+- Тестирование: сравнение скорости CPU vs Vulkan на matmul
+
+**Зависимости:** `calm_vulkan.c`, `calm_vulkan.h`, новые `.comp` файлы шейдеров
+**Ожидаемый эффект:** Ускорение 3-10× на всех matmul (Q/K/V proj, FFN gate/up/down, output)
+
+#### 3. CPU многопоточность для BQ1_0
+
+**Почему:** Сейчас весь inference однопоточный. Snapdragon 8+ Gen 1 имеет 1× X2 + 3× A710 + 4× A510 = 8 ядер. Параллелизация matmul по строкам и MoE по экспертам даст ускорение близкое к количеству ядер.
+
+**Что нужно сделать:**
+- `ct_matmul_bq1_0()`: разделить выходные строки на пулы, каждый поток обрабатывает свой диапазон строк
+- MoE expert dispatch: эксперты независимы → распараллелить 6 активных экспертов на 6 потоков
+- MLA attention: per-head параллелизация (16 heads → до 16 потоков)
+- Пул потоков: простой thread pool (`pthread_create` при старте, `pthread_cond_wait` для синхронизации)
+- Опционально: ARM NEON для BQ1_0 matmul уже есть, многопоточность даст дополнительный factor
+
+**Ожидаемый эффект:** Ускорение 4-8× на многоядерных операциях (MoE FFN, matmul)
+
+---
+
+### 💻 Ноутбук — будущее
+
+#### 2. Конвертация DeepSeek в Q8_0 + Vulkan matmul
+
+**Почему:** BQ1_0 теряет качество. На ноутбуке с 16+ GB RAM можно держать Q8_0 (8 бит, 16B → ~16 GB). Vulkan для Q8_0 уже реализован (`ct_matmul_q8_0` в calm_vulkan.c). Просто конвертнуть модель.
+
+**Что нужно сделать:**
+- Скачать DeepSeek-Coder-V2-Lite Q8_0 GGUF (~16 GB) или конвертнуть через `calm_convert --format q8_0`
+- Запустить через `calm-vk run --gpu-layers 27` — Vulkan Q8_0 matmul уже работает
+- Сравнить качество и скорость с BQ1_0
+
+**Ожидаемый эффект:** Полное ускорение на GPU, better quality, ~10-20 tok/s на ноутбуке с GPU
+
+---
+
+### Приоритет
+
+```
+Сейчас ─────→ 📱 Vulkan BQ1_0 шейдер ──→ 📱 CPU многопоточность ──→ 💻 Q8_0 (ноутбук)
+              (3-10× ускорение)           (4-8× ускорение)            (полный GPU offload)
+```
+
+Каждый шаг независим — можно делать параллельно. Порядок влияет только на то, что быстрее принесёт пользу на телефоне.
 
 ---
 
@@ -777,7 +862,26 @@ NEON-оптимизация selective scan (особенно expf-вызовы �
 
 ### 🐛 Исправленные баги (23 июля 2026)
 
-### 4. Qwythos FFN — отсутствует `post_attention_norm.weight`
+### 4. DeepSeek MLA head_dim — segfault при загрузке
+
+**Симптом:** DeepSeek-Coder-V2-Lite GGUF не грузится — segfault при чтении MLA head_dim. `n_embd/n_head` = 2048/16 = 128, но правильный MLA head_dim = 128 + 64 = 192 (nope + rope).
+
+**Причина:** В `extract_config()` head_dim вычислялся как `n_embd / n_head`, что неверно для MLA. В MLA размерность головы = `mla_qk_nope_head_dim + mla_qk_rope_head_dim`.
+
+**Фикс:** `calm_infer.c` в `extract_config()` — для MLA архитектуры head_dim = mla_qk_nope_head_dim + mla_qk_rope_head_dim (из метаданных GGUF). Закоммичен как `v0.3-mla-head-dim-fix`.
+
+### 5. DeepSeek MLA BQ1_0 — unsupported Wkv_b type 64
+
+**Симптом:** После конвертации Q2_K → BQ1_0, MLA forward падает: `[MLA] unsupported Wkv_b type 64`. Тип 64 = CT_GGUF_TYPE_BQ1_0.
+
+**Причина:** switch/case в `mla_forward_general()` не содержал case для BQ1_0. Матричные умножения (matmul) уже поддерживали BQ1_0 через `ct_matmul_bq1_0()`, но MLA-специфичный per-block dequant для absorption trick не был реализован.
+
+**Фикс (3 правки):**
+1. `calm_infer.c` — добавлена `deq_bq1_0(const void* b, float* out)`: деквантит 2 группы ct_block_bq1_0 (128 элементов каждая) в 256 float (размер блока MLA: CT_QK_K = 256)
+2. `calm_mla.c` — extern декларация `deq_bq1_0`
+3. `calm_mla.c` — case `CT_GGUF_TYPE_BQ1_0: deq_fn = deq_bq1_0;`
+
+### 6. Qwythos FFN — отсутствует `post_attention_norm.weight`
 
 **Причина:** Qwythos-9B использует `blk.N.post_attention_norm.weight` для нормализации входа FFN вместо стандартного `blk.N.ffn_norm.weight`. `build_weights()` падал при загрузке Qwythos GGUF потому что не находил ffn_norm веса.
 
