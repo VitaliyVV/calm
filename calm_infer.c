@@ -665,6 +665,9 @@ static int extract_config(ct_gguf_context* gguf, ct_infer_config* cfg) {
         /* Sanity: nope_head_dim must be positive */
         if (cfg->mla_qk_nope_head_dim <= 0)
             cfg->mla_qk_nope_head_dim = cfg->mla_qk_rope_head_dim; /* fallback */
+        /* MLA head_dim = nope_dim + rope_dim (not n_embd/n_head).
+         * This ensures buf_q is correctly sized for Q = n_head * (dn+dr). */
+        cfg->head_dim = cfg->mla_qk_nope_head_dim + cfg->mla_qk_rope_head_dim;
     }
     if (cfg->n_shared_expert == 0)
         cfg->n_shared_expert = (int)meta_get(gguf, arch, "expert_shared_count", 0);
