@@ -1,8 +1,38 @@
 # Calm — Universal Local LLM Runtime
 
 **Дорожная карта продукта**
-**Дата:** 17 июля 2026 (обновлено 17 июля 2026, 20:30 UTC)
-**Версия:** v0.3 (C engine + Vulkan + auto-config + Bonsai-format kernels)
+**Дата:** 23 июля 2026
+**Версия:** v0.3 — Qwythos NaN debug + DeepSeek MLA test phase
+**Контрольная точка:** git tag `v0.1-baseline` — Qwen2.5-0.5B Q8_0 работает, SSM+MLA интегрированы
+
+---
+
+## 🔴 Текущее состояние (23 июля 2026)
+
+### Память устройства
+```
+free:   286 MiB
+avail:  3.1 GiB
+swap:   7.4 GiB свободно
+```
+
+### Доступные модели
+```
+~/calm/                                      Размер  Статус
+  Qwythos-9B-BQ1_0.gguf                      3.0 GB  ◐ NaN в forward pass
+  DeepSeek-Coder-V2-Lite-Instruct.Q2_K.gguf   1.2 GB  ◐ не тестирован (MLA)
+  qwen2.5-0.5b-instruct-q8_0.gguf            645 MB  ✅ работает
+  qwen2.5-0.5b-instruct-bq1_0.gguf           328 MB  ✅ работает
+  qwen2.5-0.5b-instruct-tq1_0-v3.gguf        359 MB  ✅ работает
+  qwen2.5-0.5b-instruct-q4_0.gguf            283 MB  ✅ работает
+```
+
+### Приоритет сейчас — две модели
+
+| # | Модель | Блокер | Что делать |
+|---|--------|--------|------------|
+| 🔴 1 | **Qwythos-9B BQ1_0** (3.0 GB) | NaN в `ct_forward_ssm_qwythos()` | Дебаг SSM → починить → запустить |
+| 🔵 2 | **DeepSeek-Coder-V2-Lite Q2_K** (1.2 GB) | MLA никогда не тестирован | Запустить → проверить → починить баги |
 
 ---
 
@@ -645,26 +675,81 @@ Qwythos-9B использует **нестандартный SSM вариант*
 
 **Статус:** ✅ Собирается, загружается, распознаёт все 32 слоя Qwythos-9B (24 SSM + 8 attention). Forward pass produces **NaN** — причина не установлена.
 
-**Гипотезы NaN (23 июля 2026):**
-1. Проверено: `fp16_to_f32()` корректно обрабатывает NaN → возвращает 0.0 (не источник)
-2. Проверено: `ct_matmul_bq1_0()` — скалярный путь и NEON путь оба дают корректные ненулевые результаты (confirmed via atomic printf of first output element)
-3. Не проверено: Qwythos-specific selective scan — формат A и dt может отличаться от ожидаемого
-4. Не проверено: fused QKV split — возможно неверная размерность head/head_dim
-5. Не проверено: порядок RoPE — Qwythos применяет RoPE до QKV (на hidden), затем снова на Q, K
-6. Не проверено: alpha/beta discretization — может требовать другую формулу
+**Анализ кода ct_forward_ssm_qwythos() (calm_ssm.c, 23 июля 2026):**
+
+Pipeline (строки 496-568):
+```
+Step 1: xz = matmul(hidden_in, attn_qkv)           [E] → [2*E]
+Step 2: xz_conv = silu(conv1d(xz))                 [2*E] conv → [2*E]
+Step 3: split → x_part[E], z_part[E]
+Step 4: alpha = matmul(hidden_in, ssm_alpha)        [E] → [d_state]
+Step 5: dt = exp(alpha + dt_bias)                   per-state
+Step 6: beta = sigmoid(matmul(hidden_in, ssm_beta))  [E] → [d_state]
+Step 7: selective scan: h_new = a_bar*h + b_bar*x   d_state × d_inner
+Step 8: y *= sigmoid(z)                             gate
+Step 9: out = matmul(y, ssm_out)                    [E] → [E]
+```
+
+**Гипотезы NaN (23 июля 2026, обновлено с анализом кода):**
+
+1. ✅ `fp16_to_f32()` — не источник (возвращает 0.0 на NaN)
+2. ✅ `ct_matmul_bq1_0()` — не источник (корректные ненулевые результаты)
+3. ◐ **Step 1: `matmul(xz, hidden_in, lw->ssm_qkv, E, 2*E)`** — attn_qkv.weight в BQ1_0. Если размерность `[E, 2*E]` не совпадает с GGUF-метаданными, matmul производит мусор → NaN. **Проверить GGUF metadata вывод.**
+4. ◐ **Step 2: conv1d на d_xz=8192 каналов с BQ1_0 весом** — `row_stride` вычисляется через `ct_gguf_tensor_size()` для BQ1_0 (128 эл/блок). Если stride неверный — dequant читает мусор → NaN.
+5. ◐ **Step 5: `expf(alpha[s] + dt_bias[s])` без softplus** — Mamba1 использует `log(1+exp(dt))` (softplus). Qwythos использует raw exp. Если alpha[s] большой (>80), `expf(→ +Inf)`. **Inf × anything = Inf, не NaN.** Not primary cause.
+6. ◐ **Step 7: selective scan** — `alpha[s]` используется и как dt_B, и как dt_C (b_bar = dt*alpha, c_gated = alpha*beta). Если alpha содежит Inf: `Inf * 0 = NaN`.
+7. ◐ **conv_state/h_state pointer arithmetic** — `ssm_conv_state` аллоцируется как `[n_layer × d_inner × (d_conv-1)]` для Mamba1 (d_inner=2*E). Для Qwythos d_inner=E, d_xz=2*E. Conv1d использует `d_xz` каналов, НО conv_state выделен под d_inner. **Если d_conv > 1 → чтение/запись за границей буфера!**
+
+**Приоритетная гипотеза: buffer overflow в conv_state**
+```
+Mamba1: conv_state[n_layer][d_inner × (d_conv-1)]   d_inner = 2*E = 8192
+Qwythos: conv_state[n_layer][d_inner × (d_conv-1)]  d_inner = E = 4096, НО conv1d использует d_xz = 2*E = 8192
+```
+`ct_ssm_conv1d()` получает `d_inner=d_xz=8192` для Qwythos, shift-цикл (строки 142-149) пишет в conv_state[i * c_stride + ...] с i до d_xz-1 = 8191. А буфер выделен для d_inner=4096. **Запись за границу → коррупция → NaN.**
+
+**План фикса (приоритет):**
+1. Проверить: `ssm_d_inner` в метаданных Qwythos GGUF — если = 4096 (n_embd), то conv_state аллоцирован вдвое меньше нужного
+2. Читать `ssm.conv_kernel` из GGUF метаданных (cfg->ssm_d_conv) и использовать `d_xz` (2*d_inner) для conv_state Qwythos
+3. Отдельная аллокация conv_state для Qwythos: `n_layer × d_xz × (d_conv-1)`
 
 **Следующие шаги:**
-- Добавить детальный дебаг-принт в `ct_forward_ssm_qwythos()` — логировать каждый шаг (shapes, first/last values)
-- Сравнить с референсной имплементацией (llama.cpp или transformers)
-- Проверить правильность fused QKV split: `n_embd × (n_head×head_dim×3)`
-- Протестировать с fp32-весами (без квантизации) для исключения BQ1_0 багов
-- Добавить unit-test для selective scan с известными входными данными
+1. ✅ **Скачать Qwythos GGUF** — BQ1_0 (3.0 GB) скопирован в ~/calm/
+2. 🔜 **Первый запуск** — `calm-cpu run Qwythos-9B-BQ1_0.gguf 2>&1 | head -100`
+3. 🔜 **Проверить GGUF metadata** — `calm-cpu analyze Qwythos-9B-BQ1_0.gguf` → ssm_d_inner, n_embd, d_conv
+4. 🔜 **Починить conv_state аллокацию** — если подтвердится buffer overflow
+5. 🔜 **Добавить дебаг-принты** — логировать shapes и первые/последние значения каждого шага
+6. 🔜 **Проверить conv1d row_stride** для BQ1_0 с d_xz=8192
 
 ### Mamba2 (future)
 
 NEON-оптимизация selective scan (особенно expf-вызовы в цикле)
 Поддержка Mamba2 (SSM с группировкой)
 Опциональный GPU/Vulkan SSM kernel
+
+---
+
+## 🧪 Phase 9: DeepSeek MLA — Test & Fix (добавлено 23 июля 2026)
+
+**Цель:** Запустить DeepSeek-Coder-V2-Lite-Instruct.Q2_K.gguf (1.2 GB, уже на диске) через calm-cpu, проверить MLA forward pass.
+
+### Статус
+- `calm_mla.c` — реализован MLA forward pass с absorption trick
+- `calm_infer.c` — детекция MLA через `attn_kv_a.weight`, загрузка весов, KV cache alloc
+- Shared expert (DeepSeekMoE) — загрузка + FFN forward поверх routed MoE
+- **Ни разу не тестировалось** — не было подходящей GGUF модели
+
+### План тестирования
+1. `calm-cpu analyze DeepSeek-Coder-V2-Lite-Instruct.Q2_K.gguf` — проверить метаданные
+2. `calm-cpu run DeepSeek-Coder-V2-Lite-Instruct.Q2_K.gguf --max-tokens 10` — тест генерации
+3. Если падает/NaN — дебаг аналогично Qwythos
+4. Известные проблемы MLA: quantization поддержка Wkv_b в absorption loops (сейчас F32 fallback), DeepSeek2 tokenizer (BPE спецтокены)
+
+### Размеры
+| Файл | Размер | RAM |
+|------|--------|-----|
+| DeepSeek-Coder-V2-Lite-Instruct.Q2_K.gguf | 1.2 GB | ✅ влезает с запасом |
+
+---
 
 ## 🐛 Исправленные баги (17 июля 2026)
 
