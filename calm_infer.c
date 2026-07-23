@@ -632,6 +632,7 @@ static int extract_config(ct_gguf_context* gguf, ct_infer_config* cfg) {
     cfg->ssm_d_inner    = (int)meta_get(gguf, arch, "ssm.inner_size", 0);
     cfg->ssm_d_state    = (int)meta_get(gguf, arch, "ssm.state_size", 0);
     cfg->ssm_dt_rank    = (int)meta_get(gguf, arch, "ssm.time_step_rank", 0);
+    cfg->ssm_group_count = (int)meta_get(gguf, arch, "ssm.group_count", 0);
     cfg->ssm_dt_b_c_rms = (int)meta_get(gguf, arch, "ssm.dt_b_c_rms", 0);
 
     /* If ssm_d_inner not stored, default to 2 * n_embd (Mamba convention) */
@@ -783,7 +784,7 @@ static int build_weights(ct_gguf_context* gguf, ct_infer_weights* w) {
                 /* Input projection: attn_qkv.weight serves as ssm_in */
                 snprintf(name, sizeof(name), "blk.%d.attn_qkv.weight", i);
                 l->ssm_qkv = (void*)find_tensor(gguf, name, &l->t_ssm_qkv);
-                if (!l->ssm_qkv) { fprintf(stderr, "infer: missing %s\n", name); return -1; }
+                if (!l->ssm_qkv) { fprintf(stderr, "infer: missing %s (tried ssm_qkv)\n", name); return -1; }
                 /* Alias ssm_in to ssm_qkv for compatibility */
                 l->ssm_in = l->ssm_qkv; l->t_ssm_in = l->t_ssm_qkv;
 
@@ -1418,7 +1419,9 @@ ct_infer_state* ct_infer_create(ct_gguf_context* gguf, int max_ctx, int gpu_laye
         int d_conv  = cfg->ssm_d_conv;
         int d_inner = cfg->ssm_d_inner;
         int d_state = cfg->ssm_d_state;
-        size_t conv_sz = (size_t)cfg->n_layer * d_inner * (d_conv > 0 ? d_conv - 1 : 0);
+        /* Qwythos conv1d processes full xz (2*d_inner channels for QKV concat) */
+        int conv_chan = (cfg->ssm_group_count > 0) ? 2 * d_inner : d_inner;
+        size_t conv_sz = (size_t)cfg->n_layer * conv_chan * (d_conv > 0 ? d_conv - 1 : 0);
         size_t hid_sz  = (size_t)cfg->n_layer * d_state * d_inner;
 
         if (conv_sz > 0) {
@@ -1429,8 +1432,8 @@ ct_infer_state* ct_infer_create(ct_gguf_context* gguf, int max_ctx, int gpu_laye
             s->ssm_hidden_state = (float*)calloc(hid_sz, sizeof(float));
             if (!s->ssm_hidden_state) goto fail;
         }
-        fprintf(stderr, "infer: SSM caches allocated (conv=%zu els, state=%zu els)\n",
-                conv_sz, hid_sz);
+        fprintf(stderr, "infer: SSM caches allocated (conv=%zu els/%d ch, state=%zu els)\n",
+                conv_sz, conv_chan, hid_sz);
     }
 
     return s;
@@ -1480,9 +1483,11 @@ int ct_infer_forward(ct_infer_state* s, int pos,
             int d_conv  = cfg->ssm_d_conv;
             int d_state = cfg->ssm_d_state;
             int c_stride = d_conv > 1 ? d_conv - 1 : 1;
+            /* Qwythos conv1d on full xz: conv_chan = 2*d_inner; Mamba1: conv_chan = d_inner */
+            int conv_chan = (cfg->ssm_group_count > 0) ? 2 * d_inner : d_inner;
 
             float* conv_state = s->ssm_conv_state
-                ? s->ssm_conv_state + (size_t)layer * d_inner * c_stride
+                ? s->ssm_conv_state + (size_t)layer * conv_chan * c_stride
                 : NULL;
             float* hid_state  = s->ssm_hidden_state
                 ? s->ssm_hidden_state + (size_t)layer * d_state * d_inner

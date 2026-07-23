@@ -470,21 +470,27 @@ void ct_forward_ssm_qwythos(float* out, const float* hidden_in,
     int d_inner = E;               /* scan dimension (x, not xz) */
     int d_xz    = 2 * d_inner;     /* 8192 — conv1d on full xz */
     int d_conv  = cfg->ssm_d_conv; /* 4    */
-    int d_state = cfg->ssm_d_state;/* 32   */
+    int d_state = cfg->ssm_d_state;/* 128  */
 
-    if (d_inner == 0 || d_conv == 0 || d_state == 0) {
-        fprintf(stderr, "ssm_qwythos: invalid config (I=%d C=%d S=%d)\n",
-                d_inner, d_conv, d_state);
+    /* Qwythos/qwen35 grouped SSM:
+     * d_state = total states, group_count = parameter groups.
+     * Each group shares A/dt/alpha/beta for state_per_group sub-states. */
+    int n_groups = cfg->ssm_group_count > 0 ? cfg->ssm_group_count : cfg->ssm_dt_rank;
+    int state_per_group = (n_groups > 0) ? d_state / n_groups : d_state;
+
+    if (d_inner == 0 || d_conv == 0 || d_state == 0 || n_groups <= 0) {
+        fprintf(stderr, "ssm_qwythos: invalid config (I=%d C=%d S=%d G=%d)\n",
+                d_inner, d_conv, d_state, n_groups);
         memset(out, 0, (size_t)E * sizeof(float));
         return;
     }
 
-    /* Allocate scratch buffers */
+    /* Allocate scratch buffers — alpha/beta/dt sized per group (n_groups), not per state */
     float* xz      = (float*)malloc((size_t)d_xz * sizeof(float));
     float* xz_conv = (float*)malloc((size_t)d_xz * sizeof(float));
-    float* alpha   = (float*)malloc((size_t)d_state * sizeof(float));
-    float* beta    = (float*)malloc((size_t)d_state * sizeof(float));
-    float* dt      = (float*)malloc((size_t)d_state * sizeof(float));
+    float* alpha   = (float*)malloc((size_t)n_groups * sizeof(float));
+    float* beta    = (float*)malloc((size_t)n_groups * sizeof(float));
+    float* dt      = (float*)malloc((size_t)n_groups * sizeof(float));
     float* y       = (float*)malloc((size_t)d_inner * sizeof(float));
     float* tmp     = (float*)malloc((size_t)E * sizeof(float));
 
@@ -506,56 +512,72 @@ void ct_forward_ssm_qwythos(float* out, const float* hidden_in,
     float* x_part = xz_conv;
     float* z_part = xz_conv + d_inner;
 
-    /* Step 4: alpha = ssm_alpha @ normed_input → [d_state] */
-    matmul(alpha, hidden_in, lw->ssm_alpha, lw->t_ssm_alpha, E, d_state);
+    /* Step 4: alpha = ssm_alpha @ normed_input → [n_groups]
+     *   ssm_alpha.weight is [n_embd, n_groups] = [4096, 32] */
+    matmul(alpha, hidden_in, lw->ssm_alpha, lw->t_ssm_alpha, E, n_groups);
 
-    /* Step 5: dt = exp(alpha + ssm_dt_bias) — per-state discretization */
+    /* Step 5: dt = exp(alpha + ssm_dt_bias) — per-group discretization step */
     if (lw->ssm_dt_b) {
-        for (int s = 0; s < d_state; s++)
-            dt[s] = expf(alpha[s] + lw->ssm_dt_b[s]);
+        for (int g = 0; g < n_groups; g++)
+            dt[g] = expf(alpha[g] + lw->ssm_dt_b[g]);
     } else {
-        for (int s = 0; s < d_state; s++)
-            dt[s] = expf(alpha[s]);
+        for (int g = 0; g < n_groups; g++)
+            dt[g] = expf(alpha[g]);
     }
 
-    /* Step 6: beta_gate = sigmoid(ssm_beta @ normed_input) */
-    matmul(beta, hidden_in, lw->ssm_beta, lw->t_ssm_beta, E, d_state);
-    for (int s = 0; s < d_state; s++)
-        beta[s] = 1.0f / (1.0f + expf(-beta[s]));
+    /* Step 6: beta_gate = sigmoid(ssm_beta @ normed_input)
+     *   ssm_beta.weight is [n_embd, n_groups] = [4096, 32] */
+    matmul(beta, hidden_in, lw->ssm_beta, lw->t_ssm_beta, E, n_groups);
+    for (int g = 0; g < n_groups; g++)
+        beta[g] = 1.0f / (1.0f + expf(-beta[g]));
 
-    /* Step 7: Selective scan with diagonal A
+    /* Step 7: Grouped selective scan
      *
-     * For each state s in 0..d_state-1:
-     *   dt_s    = dt[s]                   (exp of discretization time)
-     *   a_bar   = exp(dt_s * A[s])        (discretized A, diagonal)
-     *   b_bar   = dt_s * alpha[s]         (B = alpha, discretized B)
-     *   c_gated = alpha[s] * beta[s]      (C * output gate)
-     *   for each channel i in 0..d_inner-1:
-     *     h_state[s][i] = a_bar * h_state[s][i] + b_bar * x_part[i]
-     *     y[i] += c_gated * h_state[s][i]
+     * For each group g (0..n_groups-1):
+     *   dt_g    = dt[g]                              (discretization step)
+     *   a_bar   = exp(dt_g * A[g])                   (diagonal A per group)
+     *   b_bar   = dt_g * alpha[g]                    (B = alpha, discretized)
+     *   c_gated = alpha[g] * beta[g]                 (C * output gate)
+     *
+     *   For each sub-state s in group (0..state_per_group-1):
+     *     global_state = g * state_per_group + s
+     *     h_new[gs][i] = a_bar * h_old[gs][i] + b_bar * x_part[i]
+     *     y[i] += c_gated * h_new[gs][i]
      *
      * h_state layout: [d_state][d_inner] contiguous per layer.
+     * A layout:       [n_groups] diagonal elements (BQ1_0 or F32).
      */
     {
-        /* ssm_a is always F32 (diagonal A, [d_state]) */
-        const float* A_ptr = (const float*)lw->ssm_a;
+        /* Dequantize diagonal A (BQ1_0 → float) */
+        float* A_vals = (float*)malloc((size_t)n_groups * sizeof(float));
+        if (!A_vals) {
+            fprintf(stderr, "ssm_qwythos: OOM for A\n");
+            goto cleanup;
+        }
+        dequant_row(A_vals, lw->ssm_a, lw->t_ssm_a, 0, n_groups);
 
         /* Initialize y to zero */
         memset(y, 0, (size_t)d_inner * sizeof(float));
 
-        for (int s = 0; s < d_state; s++) {
-            float dt_s      = dt[s];
-            float a_bar     = expf(dt_s * A_ptr[s]);
-            float b_bar     = dt_s * alpha[s];
-            float c_gated   = alpha[s] * beta[s];
-            float* h_s      = h_state + (size_t)s * d_inner;
+        for (int g = 0; g < n_groups; g++) {
+            float dt_g      = dt[g];
+            float a_bar_g   = expf(dt_g * A_vals[g]);
+            float b_bar_g   = dt_g * alpha[g];
+            float c_gated_g = alpha[g] * beta[g];
 
-            for (int i = 0; i < d_inner; i++) {
-                float h_new = a_bar * h_s[i] + b_bar * x_part[i];
-                h_s[i] = h_new;
-                y[i] += c_gated * h_new;
+            /* Apply to all sub-states within this group */
+            for (int sub = 0; sub < state_per_group; sub++) {
+                int s = g * state_per_group + sub;
+                float* h_s = h_state + (size_t)s * d_inner;
+
+                for (int i = 0; i < d_inner; i++) {
+                    float h_new = a_bar_g * h_s[i] + b_bar_g * x_part[i];
+                    h_s[i] = h_new;
+                    y[i] += c_gated_g * h_new;
+                }
             }
         }
+        free(A_vals);
     }
 
     /* Step 8: y[i] *= sigmoid(z[i]) — output gate from z */

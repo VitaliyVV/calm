@@ -41,6 +41,7 @@ typedef struct {
     int   ssm_d_inner;        /* ssm.inner_size (typically 2*n_embd) */
     int   ssm_d_state;        /* ssm.state_size (e.g. 16)          */
     int   ssm_dt_rank;        /* ssm.time_step_rank (e.g. 256)     */
+    int   ssm_group_count;    /* ssm.group_count (Qwen3.5 groups)  */
     int   ssm_dt_b_c_rms;     /* ssm.dt_b_c_rms (Jamba-style norm) */
     /* ── MLA (DeepSeek2) config (0 = standard MHA/GQA) ── */
     int   mla_kv_lora_rank;    /* attention.kv_lora_rank (e.g. 512)  */
@@ -80,13 +81,13 @@ typedef struct {
     float* ssm_c_norm;                      /* [d_state] optional norm */
     void*  ssm_dt;      int t_ssm_dt;       /* [dt_rank, d_inner] + bias */
     float* ssm_dt_b;                        /* [d_inner] bias          */
-    void*  ssm_a;       int t_ssm_a;        /* [d_state, d_inner] or [d_state] (diag) */
+    void*  ssm_a;       int t_ssm_a;        /* [d_state, d_inner], [d_state] (diag), or [n_groups] (Qwythos) */
     void*  ssm_d;       int t_ssm_d;        /* [d_inner]               */
     void*  ssm_out;     int t_ssm_out;      /* [d_inner, n_embd]       */
     /* ── Qwythos/Qwen3.5 SSM variant (used when is_ssm && ssm_qkv != NULL) ── */
     void*  ssm_qkv;     int t_ssm_qkv;      /* [n_embd, 2*d_inner] fused input proj */
-    void*  ssm_alpha;   int t_ssm_alpha;    /* [n_embd, d_state] dt/B/C proj */
-    void*  ssm_beta;    int t_ssm_beta;     /* [n_embd, d_state] output gate */
+    void*  ssm_alpha;   int t_ssm_alpha;    /* [n_embd, dt_rank] dt/B/C proj */
+    void*  ssm_beta;    int t_ssm_beta;     /* [n_embd, dt_rank] output gate */
     float* ssm_norm_w;                      /* [128] optional SSM norm */
 
     /* ── MLA (DeepSeek2) weights (used when is_mla == 1) ── */
@@ -149,7 +150,7 @@ typedef struct {
     float* mla_kv_cache;     /* [n_layer][kv_lora_rank + qk_rope_head_dim][max_ctx] */
 
     /* ── SSM (Mamba) per-layer state caches (NULL for non-SSM models) ── */
-    float* ssm_conv_state;   /* [n_layer][d_inner][d_conv-1]   */
+    float* ssm_conv_state;   /* [n_layer][conv_chan][d_conv-1] (conv_chan = d_inner or 2*d_inner for Qwythos) */
     float* ssm_hidden_state; /* [n_layer][d_state][d_inner]    */
     int gpu_layers;   /* layers offloaded to GPU (0 = CPU only, 99 = all) */
     void* vk_backend; /* ct_vulkan_backend*, optional GPU offload */
