@@ -345,13 +345,24 @@ ct_vulkan_backend* ct_vulkan_init(void) {
     ct_vulkan_backend* vk = (ct_vulkan_backend*)calloc(1, sizeof(ct_vulkan_backend));
     if (!vk) return NULL;
 
-    /* Load vkCreateInstance first — the rest via getProcAddr */
-    vk_handle = dlopen("libvulkan.so", RTLD_NOW | RTLD_LOCAL);
-    if (!vk_handle) {
-        vk_handle = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
+    /* Load vkCreateInstance first — the rest via getProcAddr.
+     * Try Android system Vulkan loader first (HAL-based, uses real GPU),
+     * then fall back to Termux/standard libvulkan.so. */
+    static const char* vk_paths[] = {
+        "/system/lib64/libvulkan.so",    /* Android HAL — hardware Adreno */
+        "libvulkan.so",
+        "libvulkan.so.1",
+        NULL
+    };
+    for (int i = 0; vk_paths[i]; i++) {
+        vk_handle = dlopen(vk_paths[i], RTLD_NOW | RTLD_LOCAL);
+        if (vk_handle) {
+            fprintf(stderr, "vulkan: loaded %s\n", vk_paths[i]);
+            break;
+        }
     }
     if (!vk_handle) {
-        fprintf(stderr, "vulkan: libvulkan.so not found\n");
+        fprintf(stderr, "vulkan: libvulkan.so not found (tried system HAL and default)\n");
         goto fail;
     }
 
