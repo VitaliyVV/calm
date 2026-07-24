@@ -412,6 +412,11 @@ void deq_bq1_0(const void* b, float* out) {
 
 void rms_norm(float* y, const float* x, const float* w,
               int n, float eps) {
+    /* Check for obviously invalid pointers */
+    if ((uintptr_t)x < 0x1000 || (uintptr_t)w < 0x1000 || (uintptr_t)y < 0x1000) {
+        fprintf(stderr, "[DBG] rms_norm INVALID: y=%p x=%p w=%p n=%d eps=%g\n", (void*)y, (void*)x, (void*)w, n, eps);
+        return;
+    }
     float ss = 0.0f;
     for (int i = 0; i < n; i++) ss += x[i] * x[i];
     float scale = 1.0f / sqrtf(ss / (float)n + eps);
@@ -1258,94 +1263,98 @@ ct_infer_state* ct_infer_create(ct_gguf_context* gguf, int max_ctx, int gpu_laye
         goto fail;
 
 #ifdef CT_VULKAN
-    /* Initialize Vulkan backend and upload Q8_0 weights */
-    vk_init_backend();
-    if (g_vk) {
-        fprintf(stderr, "vk: uploading weights...\n");
-        ct_infer_weights* wgt = &s->w;
-        int n_uploaded = 0;
-        /* Upload token_embd if Q8_0 */
-        {
-            const ct_gguf_tensor_info* t = ct_gguf_find_tensor(gguf, "token_embd.weight");
-            if (t && t->type == CT_GGUF_TYPE_Q8_0) {
-                int I = (int)t->dims[0], O = (int)t->dims[1];
-                vk_upload_weight(ct_gguf_tensor_data(gguf, t), I, O, "token_embd.weight");
-            }
-        }
-        /* Upload output_weight if Q8_0 */
-        {
-            const ct_gguf_tensor_info* t = ct_gguf_find_tensor(gguf, "output.weight");
-            if (!t) t = ct_gguf_find_tensor(gguf, "token_embd.weight");
-            if (t && t->type == CT_GGUF_TYPE_Q8_0) {
-                const void* data = ct_gguf_tensor_data(gguf, t);
-                /* output.weight is a separate tensor, not same as token_embd */
-                t = ct_gguf_find_tensor(gguf, "output.weight");
+    /* Initialize Vulkan only if GPU layers requested.
+     * gpu_layers=0 means --backend cpu was passed — skip Vulkan entirely.
+     * matmul() auto-falls to CPU/NEON when g_vk is NULL. */
+    if (gpu_layers > 0) {
+        vk_init_backend();
+        if (g_vk) {
+            fprintf(stderr, "vk: uploading weights...\n");
+            ct_infer_weights* wgt = &s->w;
+            int n_uploaded = 0;
+            /* Upload token_embd if Q8_0 */
+            {
+                const ct_gguf_tensor_info* t = ct_gguf_find_tensor(gguf, "token_embd.weight");
                 if (t && t->type == CT_GGUF_TYPE_Q8_0) {
                     int I = (int)t->dims[0], O = (int)t->dims[1];
-                    vk_upload_weight(ct_gguf_tensor_data(gguf, t), I, O, "output.weight");
+                    vk_upload_weight(ct_gguf_tensor_data(gguf, t), I, O, "token_embd.weight");
                 }
             }
+            /* Upload output_weight if Q8_0 */
+            {
+                const ct_gguf_tensor_info* t = ct_gguf_find_tensor(gguf, "output.weight");
+                if (!t) t = ct_gguf_find_tensor(gguf, "token_embd.weight");
+                if (t && t->type == CT_GGUF_TYPE_Q8_0) {
+                    const void* data = ct_gguf_tensor_data(gguf, t);
+                    /* output.weight is a separate tensor, not same as token_embd */
+                    t = ct_gguf_find_tensor(gguf, "output.weight");
+                    if (t && t->type == CT_GGUF_TYPE_Q8_0) {
+                        int I = (int)t->dims[0], O = (int)t->dims[1];
+                        vk_upload_weight(ct_gguf_tensor_data(gguf, t), I, O, "output.weight");
+                    }
+                }
+            }
+            /* Per-layer Q8_0 weights (only first gpu_layers) */
+            int vk_max_layer = (s->gpu_layers >= cfg->n_layer || s->gpu_layers >= 99)
+                            ? cfg->n_layer : s->gpu_layers;
+            for (int i = 0; i < vk_max_layer; i++) {
+                ct_infer_layer* lw = &s->w.layers[i];
+                char name[128];
+                /* Check each weight in the layer */
+                if (lw->t_q == CT_GGUF_TYPE_Q8_0 && lw->attn_q) {
+                    snprintf(name, sizeof(name), "blk.%d.attn_q.weight", i);
+                    vk_upload_weight(lw->attn_q, cfg->n_embd, cfg->n_head * cfg->head_dim, name);
+                }
+                if (lw->t_k == CT_GGUF_TYPE_Q8_0 && lw->attn_k) {
+                    snprintf(name, sizeof(name), "blk.%d.attn_k.weight", i);
+                    vk_upload_weight(lw->attn_k, cfg->n_embd, cfg->n_head_kv * cfg->head_dim, name);
+                }
+                if (lw->t_v == CT_GGUF_TYPE_Q8_0 && lw->attn_v) {
+                    snprintf(name, sizeof(name), "blk.%d.attn_v.weight", i);
+                    vk_upload_weight(lw->attn_v, cfg->n_embd, cfg->n_head_kv * cfg->head_dim, name);
+                }
+                if (lw->t_o == CT_GGUF_TYPE_Q8_0 && lw->attn_out) {
+                    snprintf(name, sizeof(name), "blk.%d.attn_output.weight", i);
+                    vk_upload_weight(lw->attn_out, cfg->n_head * cfg->head_dim, cfg->n_embd, name);
+                }
+                if (lw->t_g == CT_GGUF_TYPE_Q8_0 && lw->ffn_gate) {
+                    if (cfg->n_expert > 0) {
+                        snprintf(name, sizeof(name), "blk.%d.ffn_gate.weight", i);
+                        vk_upload_weight(lw->ffn_gate, cfg->n_embd, cfg->n_expert, name);
+                    } else {
+                        snprintf(name, sizeof(name), "blk.%d.ffn_gate.weight", i);
+                        vk_upload_weight(lw->ffn_gate, cfg->n_embd, cfg->n_ff, name);
+                    }
+                }
+                if (lw->t_u == CT_GGUF_TYPE_Q8_0 && lw->ffn_up) {
+                    snprintf(name, sizeof(name), "blk.%d.ffn_up.weight", i);
+                    vk_upload_weight(lw->ffn_up, cfg->n_embd, cfg->n_ff, name);
+                }
+                if (lw->t_d == CT_GGUF_TYPE_Q8_0 && lw->ffn_down) {
+                    snprintf(name, sizeof(name), "blk.%d.ffn_down.weight", i);
+                    vk_upload_weight(lw->ffn_down, cfg->n_ff, cfg->n_embd, name);
+                }
+                /* MoE expert weights (if any) */
+                if (cfg->n_expert > 0 && lw->expert_gate) {
+                    for (int e = 0; e < cfg->n_expert; e++) {
+                        if (lw->t_eg[e] == CT_GGUF_TYPE_Q8_0 && lw->expert_gate[e]) {
+                            snprintf(name, sizeof(name), "blk.%d.expert.%d.gate.weight", i, e);
+                            vk_upload_weight(lw->expert_gate[e], cfg->n_embd, cfg->n_ff, name);
+                        }
+                        if (lw->t_eu[e] == CT_GGUF_TYPE_Q8_0 && lw->expert_up[e]) {
+                            snprintf(name, sizeof(name), "blk.%d.expert.%d.up.weight", i, e);
+                            vk_upload_weight(lw->expert_up[e], cfg->n_embd, cfg->n_ff, name);
+                        }
+                        if (lw->t_ed[e] == CT_GGUF_TYPE_Q8_0 && lw->expert_down[e]) {
+                            snprintf(name, sizeof(name), "blk.%d.expert.%d.down.weight", i, e);
+                            vk_upload_weight(lw->expert_down[e], cfg->n_ff, cfg->n_embd, name);
+                        }
+                    }
+                }
+            }
+            fprintf(stderr, "vulkan: uploaded %d weight tensors\n", g_vk_n);
+            s->vk_backend = g_vk;
         }
-        /* Per-layer Q8_0 weights (only first gpu_layers) */
-        int vk_max_layer = (s->gpu_layers >= cfg->n_layer || s->gpu_layers >= 99)
-                           ? cfg->n_layer : s->gpu_layers;
-        for (int i = 0; i < vk_max_layer; i++) {
-            ct_infer_layer* lw = &s->w.layers[i];
-            char name[128];
-            /* Check each weight in the layer */
-            if (lw->t_q == CT_GGUF_TYPE_Q8_0 && lw->attn_q) {
-                snprintf(name, sizeof(name), "blk.%d.attn_q.weight", i);
-                vk_upload_weight(lw->attn_q, cfg->n_embd, cfg->n_head * cfg->head_dim, name);
-            }
-            if (lw->t_k == CT_GGUF_TYPE_Q8_0 && lw->attn_k) {
-                snprintf(name, sizeof(name), "blk.%d.attn_k.weight", i);
-                vk_upload_weight(lw->attn_k, cfg->n_embd, cfg->n_head_kv * cfg->head_dim, name);
-            }
-            if (lw->t_v == CT_GGUF_TYPE_Q8_0 && lw->attn_v) {
-                snprintf(name, sizeof(name), "blk.%d.attn_v.weight", i);
-                vk_upload_weight(lw->attn_v, cfg->n_embd, cfg->n_head_kv * cfg->head_dim, name);
-            }
-            if (lw->t_o == CT_GGUF_TYPE_Q8_0 && lw->attn_out) {
-                snprintf(name, sizeof(name), "blk.%d.attn_output.weight", i);
-                vk_upload_weight(lw->attn_out, cfg->n_head * cfg->head_dim, cfg->n_embd, name);
-            }
-            if (lw->t_g == CT_GGUF_TYPE_Q8_0 && lw->ffn_gate) {
-                if (cfg->n_expert > 0) {
-                    snprintf(name, sizeof(name), "blk.%d.ffn_gate.weight", i);
-                    vk_upload_weight(lw->ffn_gate, cfg->n_embd, cfg->n_expert, name);
-                } else {
-                    snprintf(name, sizeof(name), "blk.%d.ffn_gate.weight", i);
-                    vk_upload_weight(lw->ffn_gate, cfg->n_embd, cfg->n_ff, name);
-                }
-            }
-            if (lw->t_u == CT_GGUF_TYPE_Q8_0 && lw->ffn_up) {
-                snprintf(name, sizeof(name), "blk.%d.ffn_up.weight", i);
-                vk_upload_weight(lw->ffn_up, cfg->n_embd, cfg->n_ff, name);
-            }
-            if (lw->t_d == CT_GGUF_TYPE_Q8_0 && lw->ffn_down) {
-                snprintf(name, sizeof(name), "blk.%d.ffn_down.weight", i);
-                vk_upload_weight(lw->ffn_down, cfg->n_ff, cfg->n_embd, name);
-            }
-            /* MoE expert weights (if any) */
-            if (cfg->n_expert > 0 && lw->expert_gate) {
-                for (int e = 0; e < cfg->n_expert; e++) {
-                    if (lw->t_eg[e] == CT_GGUF_TYPE_Q8_0 && lw->expert_gate[e]) {
-                        snprintf(name, sizeof(name), "blk.%d.expert.%d.gate.weight", i, e);
-                        vk_upload_weight(lw->expert_gate[e], cfg->n_embd, cfg->n_ff, name);
-                    }
-                    if (lw->t_eu[e] == CT_GGUF_TYPE_Q8_0 && lw->expert_up[e]) {
-                        snprintf(name, sizeof(name), "blk.%d.expert.%d.up.weight", i, e);
-                        vk_upload_weight(lw->expert_up[e], cfg->n_embd, cfg->n_ff, name);
-                    }
-                    if (lw->t_ed[e] == CT_GGUF_TYPE_Q8_0 && lw->expert_down[e]) {
-                        snprintf(name, sizeof(name), "blk.%d.expert.%d.down.weight", i, e);
-                        vk_upload_weight(lw->expert_down[e], cfg->n_ff, cfg->n_embd, name);
-                    }
-                }
-            }
-        }
-        fprintf(stderr, "vulkan: uploaded %d weight tensors\n", g_vk_n);
-        s->vk_backend = g_vk;
     }
 #endif
 
@@ -1504,6 +1513,7 @@ int ct_infer_forward(ct_infer_state* s, int pos,
                 : NULL;
 
             /* RMS norm (same norm used by SSM block as input normalization) */
+            if (layer < 3) fprintf(stderr, "[DBG] L%d rms_norm(ssm_attn): w=%p\n", layer, (void*)lw->attn_norm);
             rms_norm(s->normed, h, lw->attn_norm, E, cfg->norm_rms_eps);
 
             if (lw->ssm_qkv) {
@@ -1522,7 +1532,7 @@ int ct_infer_forward(ct_infer_state* s, int pos,
             /* ── Attention sub-block ── */
 
             /* RMS norm (s->normed is dedicated — no aliasing with bufs) */
-            if (0) { /* CALM_DEBUG:layer0pos23 disabled */
+            if (0) { /* CALM_DEBUG:layer0pos23 enabled */
                 float h_sum = 0, h_min = 1e9, h_max = -1e9;
                 for (int j = 0; j < E; j++) {
                     h_sum += h[j];
@@ -1533,7 +1543,7 @@ int ct_infer_forward(ct_infer_state* s, int pos,
                         pos, h_min, h_max, h_sum, fmaxf(fabsf(h_min), fabsf(h_max)));
             }
             rms_norm(s->normed, h, lw->attn_norm, E, cfg->norm_rms_eps);
-            if (0) { /* CALM_DEBUG:layer0pos23 disabled */
+            if (0) { /* CALM_DEBUG:layer0pos23 enabled */
                 float n_sum = 0, n_min = 1e9, n_max = -1e9;
                 for (int j = 0; j < E; j++) {
                     n_sum += s->normed[j];
@@ -1573,7 +1583,7 @@ int ct_infer_forward(ct_infer_state* s, int pos,
 #endif
                 __asm__ volatile("" ::: "memory");
                 matmul(s->buf_q, s->normed, lw->attn_q, lw->t_q, E, H * HD);
-                if (0) { /* CALM_DEBUG:layer0pos23 disabled */
+                if (0) { /* CALM_DEBUG:layer0pos23 enabled */
                     float q_sum = 0, q_min = 1e9, q_max = -1e9;
                     for (int j = 0; j < H*HD; j++) {
                         q_sum += s->buf_q[j];
@@ -1670,7 +1680,7 @@ int ct_infer_forward(ct_infer_state* s, int pos,
 #endif
                 for (int i = 0; i < E; i++)
                     h[i] += s->ffbuf[i];
-                if (0) { /* CALM_DEBUG:layer0pos23 disabled */
+                if (0) { /* CALM_DEBUG:layer0pos23 enabled */
                     float h_sum = 0, h_min = 1e9, h_max = -1e9;
                     for (int j = 0; j < E; j++) {
                         h_sum += h[j];
@@ -2089,16 +2099,16 @@ int ct_infer_generate(ct_infer_state* s,
 
     /* Generation loop */
     for (int gen = 0; gen < max_gen; gen++) {
-        /* Debug: hidden state before final RMS norm (DISABLED) */
-        if (0) {
+        /* Debug: hidden state before final RMS norm */
+        if (1) {
             float h_min=1e9, h_max=-1e9, h_ss=0;
             for (int i=0; i<E; i++) {
                 if (layer_out[i] < h_min) h_min = layer_out[i];
                 if (layer_out[i] > h_max) h_max = layer_out[i];
                 h_ss += layer_out[i] * layer_out[i];
             }
-            fprintf(stderr, "[DBG] pre-norm h: range=[%.4f,%.4f] rms=%.4f\n",
-                    h_min, h_max, sqrtf(h_ss/E));
+            fprintf(stderr, "[DBG] gen=%d pre-norm h: range=[%.4f,%.4f] rms=%.4f sum=%.2f\n",
+                    gen, h_min, h_max, sqrtf(h_ss/E), h_ss);
         }
         /* Final RMS norm (into normed buffer to avoid aliasing matmul) */
         rms_norm(s->normed, layer_out, s->w.final_norm, E, cfg->norm_rms_eps);
@@ -2111,6 +2121,24 @@ int ct_infer_generate(ct_infer_state* s,
             /* Weight tying: use token_embd */
             matmul(s->logits, s->normed, s->w.token_embd,
                    s->w.t_embd, E, cfg->n_vocab);
+        }
+        /* Debug: top-5 logits */
+        {
+            int top5[5] = {-1,-1,-1,-1,-1};
+            float top5v[5] = {-1e9,-1e9,-1e9,-1e9,-1e9};
+            for (int i = 0; i < cfg->n_vocab; i++) {
+                float v = s->logits[i];
+                for (int r = 0; r < 5; r++) {
+                    if (v > top5v[r]) {
+                        for (int s = 4; s > r; s--) { top5[s] = top5[s-1]; top5v[s] = top5v[s-1]; }
+                        top5[r] = i; top5v[r] = v;
+                        break;
+                    }
+                }
+            }
+            fprintf(stderr, "[DBG] gen=%d top5:", gen);
+            for (int r = 0; r < 5; r++) fprintf(stderr, " %d(%.2f)", top5[r], top5v[r]);
+            fprintf(stderr, "\n");
         }
         /* Debug: verify logit[128000] (DISABLED) */
         if (0) {

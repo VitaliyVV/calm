@@ -507,6 +507,15 @@ static void quantize_row(const float* x, int cols, void* dst, int dst_type,
             }
             return;
         }
+        case CT_GGUF_TYPE_Q4_0: {
+            int nblk = (cols + 31) / 32;
+            ct_block_q4_0* blk = (ct_block_q4_0*)dst;
+            for (int b = 0; b < nblk; b++) {
+                int count = (b + 1) * 32 <= cols ? 32 : cols - b * 32;
+                ct_quant_q4_0(x + b * 32, &blk[b], count);
+            }
+            return;
+        }
         case CT_GGUF_TYPE_Q8_0: {
             int nblk = (cols + 31) / 32;
             ct_block_q8_0* blk = (ct_block_q8_0*)dst;
@@ -1210,7 +1219,7 @@ int main(int argc, char** argv) {
         else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             printf("Calm Model Converter v0.2 — Phase 6 (Streaming Requantizer)\n");
             printf("  --input <file.gguf>     Source GGUF model\n");
-            printf("  --format <bq1_0|tq1_0>  Target format (default: tq1_0)\n");
+            printf("  --format <bq1_0|tq1_0|q4_0>  Target format (default: tq1_0)\n");
             printf("  --output <file.gguf>    Output path\n");
             printf("  --calibrate             MSE-optimal ternary calibration (slower, better quality)\n");
             printf("  --no-preserve           Don't preserve embed/output in Q8_0\n");
@@ -1233,8 +1242,11 @@ int main(int argc, char** argv) {
     } else if (strcmp(format, "tq1_0") == 0) {
         dst_type = CT_GGUF_TYPE_TQ1_0;
         format_name = "TQ1_0 (ternary 1.58-bit)";
+    } else if (strcmp(format, "q4_0") == 0) {
+        dst_type = CT_GGUF_TYPE_Q4_0;
+        format_name = "Q4_0 (4-bit)";
     } else {
-        fprintf(stderr, "Error: unknown format '%s'. Use bq1_0 or tq1_0.\n", format);
+        fprintf(stderr, "Error: unknown format '%s'. Use bq1_0, tq1_0, or q4_0.\n", format);
         return 1;
     }
 

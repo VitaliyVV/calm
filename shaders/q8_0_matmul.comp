@@ -53,7 +53,7 @@ float fp16_to_fp32_u(uint h_bits) {
             uint m = mant;
             while ((m & 0x0400) == 0) { m <<= 1; s--; }
             m &= 0x03FF;
-            uint exp32 = uint(127 - 14 - s);
+            uint exp32 = uint(127 - 24 + s);
             r = sign | (exp32 << 23) | (m << 13);
         }
     } else if (exp16 == 31) {
