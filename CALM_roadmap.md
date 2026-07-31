@@ -1,7 +1,7 @@
 # Calm — Universal Local LLM Runtime
 
 **Дорожная карта продукта**
-**Дата:** 28 июля 2026 (обновлено 31 июля 2026)
+**Дата:** 28 июля 2026 (обновлено 1 августа 2026)
 **Версия:** v0.4 (C engine + AVX2 x86 + Vulkan + auto-config + Bonsai-format kernels)
 
 ---
@@ -350,7 +350,7 @@ total params: ~15.7B
 - Calm MoE core: уже есть ✅ — router + expert dispatch
 - KV cache: уже есть ✅ — но MLA требует меньший cache (преимущество)
 
-### Статус: ◐ В разработке (18 июля 2026)
+### Статус: ◐ В разработке (1 августа 2026)
 
 **Реализовано:**
 - `calm_mla.h` / `calm_mla.c` — MLA forward pass с absorption trick (Q_nope @ Wk_b → absorbed_q, weighted latent sum → V)
@@ -382,7 +382,7 @@ total params: ~15.7B
 Фаза 5: Production release       │ ░░░░░░░░░░░░░░░░  4-8 нед
 Фаза 6: GGUF↔GGUF Requantizer    │ ████████░░░░░░░░  1-2 нед    ◐ streaming done
 Фаза 7: SSM Forward Pass         │ ████████████████  2-3 нед    ✅
-Фаза 8: DeepSeek2 (MLA+MoE)      │ █████░░░░░░░░░░░  2-3 нед    ◐ integrated
+Фаза 8: DeepSeek2 (MLA+MoE)      │ ██████░░░░░░░░░░  2-3 нед    ◐ MLA core validated
 Фаза 9: x86/AVX2 Laptop Opt.     │ █████▓░░░░░░░░░░  1 нед      ◐ AVX2 kernels done
                                      └── ~5-10 месяцев всего
 ```
@@ -410,7 +410,7 @@ total params: ~15.7B
 10. ✅ **GGUF→TQ1_0/BQ1_0 конвертер** — `calm_convert.c`
 11. ◐ **Phase 6: GGUF→GGUF Requantizer** — streaming core ✅, dequant F32/F16/Q8_0/Q4_0/Q4_1/Q5_0/Q5_1/Q2_K/Q4_K/Q5_K/Q6_K ✅, остались IQ форматы
 12. ✅ **Phase 7: SSM Forward Pass** — Mamba-style selective scan для Qwen3.5/Jamba/Ornith гибридов
-13. ◐ **Phase 8: DeepSeek2 (MLA+MoE)** — Multi-head Latent Attention + DeepSeekMoE (forward pass integrated: calm_mla.c, calm_infer.h/c, shared expert, absorption trick)
+13. ◐ **Phase 8: DeepSeek2 (MLA+MoE)** — Multi-head Latent Attention + DeepSeekMoE (forward pass integrated; quantized Wkv_b блочная адресация + k_norm/kv_a_norm фиксы + переполнения буферов исправлены; synthetic MLA test ALL PASS — F32/Q8_0 против референса; осталось: токенизатор, MoE 64×top-6, реальная модель)
 14. ◐ **Phase 9: x86/AVX2** — AVX2 matmul Q8_0/Q4_0/BQ1_0/TQ1_0 ✅, dequant/quant ✅, Makefile x86 ◐, CPUID Windows 🔲
 15. 📦 **mmap/expert streaming** — Colibri-style, холодные эксперты с диска
 16. 📦 **Qwen3.6 архитектура** — для запуска Bonsai-27B (1-bit, 3.9 GB) — зависит от Phase 7
@@ -795,3 +795,44 @@ DeepSeek-V3-671B     BQ1_0    94 GB  ❌ (не влезет)
 - Независимый FP32-эталон строки 62 ffn_down (L21): `fp32ref == matmul` бит-в-бит (`diff=0.000000`) — деквант + matmul корректны
 - Обнаруженный при расследовании «спайк» нейрона 62 ffn_down (≈−695 на L21) — **реальные веса модели**: воспроизводится в двух независимых квантованиях (Q6_K и Q4_0), у строки 62 глобально-максимальный d=0.000153 (блок 1180) и второй по величине 0.000146 (блок 13); вход ffn_down на L21 содержит элемент |x|=1117 (silu(gate)*up). Не баг кода — особенность модели, остаточный рост h (146→7035) ниже старого эталона (245→15037).
 - Побочный результат аудита: удалены все временные отладочные принты из forward pass (calm_infer.c), сборка MSVC `/W4` — 0 предупреждений.
+
+---
+
+## 🐛 Исправленные баги Phase 8 — MLA (1 августа 2026)
+
+### 5. Quantized Wkv_b — неверная блочная адресация (general path)
+
+**Причина:** Код адресовал блоки квантизованного Wkv_b смещением `k * blocks_per_row + kg` (как будто блоки идут вдоль **строк**), но GGUF хранит тензор `[ne0=dc, ne1=total_cols]` с ne0 fastest — блоки идут вдоль **dc** (колонок). Для типов с блоком 256 и `total_per_head=256` случайно совпадало, но для 32-элементных (Q8_0/Q4_0/Q5_0/Q4_1/IQ4_NL) и любых dc≠256 — чтение чужих блоков → мусорные absorbed_q/out_h.
+
+**Симптом:** synthetic MLA test: Q8_0 путь vs референс — ошибка ~100% (43.28 при ref scale 43.28), выход ≈ нули.
+
+**Фикс:** `calm_mla.c` — адресация по GGUF layout: `block index = c*nb + kb`, `nb = ceil(dc/block)`, `block_stride = ct_gguf_tensor_size(type, 1, {block})`; `block` = 256 (K-quants) / 32 (Q8_0, Q4_0, Q5_0, Q4_1, IQ4_NL). Q8_0/Q4_0 добавлены в диспетчер через `deq_q8_0_wrap`/`deq_q4_0_wrap` (адаптеры под `(block, out, count)` сигнатуру).
+
+### 6. `attn_kv_a_norm` нормировал только `dc` вместо `dc+dr`
+
+**Причина:** general path нормировал первые `dc` элементов латента, F32 path — все `dc+dr`. Расхождение путей → разные scores при включённой `attn_kv_a_norm`.
+
+**Фикс:** `calm_mla.c` — `rms_norm(..., dc + dr, ...)` в general path (совпадает с F32 path и llama.cpp).
+
+### 7. Step 3 k_norm — переполнение `kv_b_cur[4096]` + неверная семантика
+
+**Причина:** `matmul(kv_b_cur, c, wkv_b, t, dc, H*total_per_head)` раскрывал K_nope сразу для всех H групп: DS-Coder-V2-Lite требует `H*total_per_head = 16*320 = 5120` колонок > 4096 → переполнение стека. Плюс scale записывался в сами kh (затирая kv_b_cur) вместо хранения RMS для последующего деления scores.
+
+**Фикс:** `calm_mla.c` — группы раскрываются по одной (`matmul(..., dc, total_per_head)` со смещением `ct_gguf_tensor_size(t_kvb, 2, {dc, kg*total_per_head})` — 2D-offset в GGUF), RMS каждой группы пишется в кэш-строку `(dc+dr+kg)`; **оба** пути Step 4b делят `dot_nope` на `rms_p`. Plain RMS — вес `attn_k_norm` намеренно не применяется (конвенция `attn_q_norm`).
+
+### 8. Heap overflow `buf_q_size` в `calm_infer.c` (реальный баг инференса)
+
+**Причина:** `buf_q_size = max(n_embd, …, H*head_dim)` = 2048 для DS-Coder-V2-Lite, но MLA Step 1 пишет `H*(dn+dr)` = 16×192 = **3072** floats в `s->buf_q` → запись за границу кучи при каждом forward pass MLA-модели.
+
+**Фикс:** `calm_infer.c` (~1354) — при `mla_kv_lora_rank > 0`: `buf_q_size = max(..., H*(qk_nope_head_dim + qk_rope_head_dim))`. Сопутствующий фикс: `mla_cache_dim` увеличен на `+ n_head_kv` строк/слой (alloc ~1325 и slice ~1466) — для хранения per-head-group RMS.
+
+### 9. Synthetic MLA test не вызывал `ct_quant_init()`
+
+**Причина:** тест квантил Q8_0 без инициализации таблицы fp16 (`ct_fp16_table` в calm_quant.c) — все масштабы = 0 → деквант = нули → Q8_0 путь давал 0.00. **Не баг продакшн-кода** (calm_infer.c:1180 вызывает `ct_quant_init()` при загрузке модели).
+
+**Фикс:** `calm_mla_test.c` — `ct_quant_init()` в `main()`.
+
+**Верификация (1 августа 2026, MSVC/AVX2, `/W4` 0 предупреждений):**
+- `calm_mla_test.exe`: F32 vs референс max_abs 1.9e-5 / 1.3e-5 / 5.7e-6; Q8_0 vs референс 0.54 / 0.26 / 0.11 (допуск 5%) — **ALL PASS**, 3 комбо (k_norm/kv_a_norm), Q8_0 roundtrip max_err 8.1e-3
+- `calm_smoke.exe` (MSVC/Windows): PASS на Llama-3.2-1B Q8_0 и qwen2.5-0.5b Q4_0 — без NaN/Inf
+- Коммит `48cb791`: 4 файла, +408/−72
