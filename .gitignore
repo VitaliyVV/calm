@@ -29,3 +29,6 @@ test_tokenizer
 test_vec
 # Temp debugging files
 /tmp/
+
+# Session handoff summaries (not part of the project)
+handoff-*.md
