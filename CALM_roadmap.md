@@ -908,8 +908,16 @@ github.com/VitaliyVV/calm  (origin, единственный канал синх
    Разовое копирование допустимо только как консолидация при восстановлении порядка.
 3. **Каждый коммит = push в origin.** `git commit && git push origin main` одним действием.
    Это автоматически синхронизирует все остальные копии при их следующем pull.
+   Для неинтерактивного push в WSL настроен `credential.helper store` (токен из Windows
+   Credential Manager) — push выполняется без запроса логина/пароля.
 4. **Незакоммиченные правки в неактивных копиях**: либо коммитить, либо отбрасывать —
    никогда не оставлять «плавать» (именно они и были потеряны при перезаписи).
+
+> ⚠️ **Особенность запуска git в WSL:** `wsl.exe` наследует Windows-CWD, и git, запущенный
+> без смены директории, падает с `fatal: cannot chdir to 'C:/'`. Все git-команды в WSL
+> запускать только с `cd ~/calm &&` в начале, например:
+> `wsl -d Ubuntu -- bash -c "cd ~/calm && git status"`. Сам git при этом исправен —
+> это ограничение запуска через `wsl.exe` из Windows-каталога.
 
 ### Сборка — два нативных пути (WSL не обязателен)
 
@@ -924,8 +932,9 @@ calm_mla_test.exe, calm_convert.exe). WSL — среда разработки/с
 
 ### Текущее состояние (после консолидации 1 августа 2026)
 
-- WSL `~/calm` — HEAD `e543cd1` (Phase 8 closed) — источник истины
-- Windows-клон синхронизирован файлами: свежие исходники, бинарники, модели
-  (DeepSeek-Coder-V2-Lite Q2_K 6 GB, dscoder-6.7b) + `tools/` (билд-скрипты, дамперы)
+- WSL `~/calm` — HEAD `388c65e` (рабочий процесс + синхронизация) — источник истины, запушен в origin
+- Windows-клон синхронизирован **через git** (`fetch + reset --hard origin/main`, HEAD = `388c65e`):
+  свежие исходники, бинарники, модели (DeepSeek-Coder-V2-Lite Q2_K 6 GB, dscoder-6.7b) + `tools/`
+  (билд-скрипты, дамперы) — клон содержит только untracked-артефакты (*.exe, tools/, build_msvc.bat)
 - Вспомогательные скрипты: `tools/build_*.bat`, `tools/dump_gguf.c`, `tools/check_shexp.sh`,
   `tools/check_gguf*.py`, `tools/gguf_names.py` (скопированы из temp рабочей сессии)
