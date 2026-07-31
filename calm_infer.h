@@ -155,7 +155,9 @@ typedef struct {
 void rope(float* buf, int n, int pos, float base);
 void rms_norm(float* y, const float* x, const float* w, int n, float eps);
 void matmul(float* y, const float* x, const void* w, int type, int I, int O);
-void embed_row(float* out, const void* table, int type, int token, int n_embd);
+/* Embedding lookup with vocab bounds check. Returns 0 on success, -1 if
+ * token is out of range (out is zeroed). n_vocab = number of rows in table. */
+int embed_row(float* out, const void* table, int type, int token, int n_embd, int n_vocab);
 
 /* ─── API ─── */
 

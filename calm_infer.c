@@ -486,8 +486,15 @@ void rope(float* buf, int n, int pos, float base) {
  * Handles F32, Q8_0, Q4_0 (most models use F32 for embeddings).
  * ═══════════════════════════════════════════════════════════════ */
 
-void embed_row(float* out, const void* table, int type,
-               int token, int n_embd) {
+int embed_row(float* out, const void* table, int type,
+               int token, int n_embd, int n_vocab) {
+    /* Bounds check: token outside vocab -> zero out + report error.
+     * Prevents OOB read past the end of the embedding table
+     * (e.g. BPE special tokens with id >= vocab_size). */
+    if (token < 0 || token >= n_vocab) {
+        memset(out, 0, (size_t)n_embd * sizeof(float));
+        return -1;
+    }
     /* Compute byte offset for the requested token's row */
     size_t row_size;
     uint64_t dims[2] = {(uint64_t)n_embd, 1};
@@ -585,6 +592,7 @@ void embed_row(float* out, const void* table, int type,
             memset(out, 0, (size_t)n_embd * sizeof(float));
             break;
     }
+    return 0;
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -1856,7 +1864,7 @@ int ct_infer_generate(ct_infer_state* s,
      * across positions so attention can look back at earlier tokens. */
     float* layer_out = s->buf_q; /* reuse — working buffer */
     for (int i = 0; i < n_prompt; i++) {
-        embed_row(s->hidden, s->w.token_embd, s->w.t_embd, tokens[i], E);
+        embed_row(s->hidden, s->w.token_embd, s->w.t_embd, tokens[i], E, cfg->n_vocab);
         if (ct_infer_forward(s, i, s->hidden, layer_out) != 0)
             return -1;
     }
@@ -1911,7 +1919,7 @@ int ct_infer_generate(ct_infer_state* s,
         if (total >= s->max_ctx) break;
 
         /* Embed next token for next iteration */
-        embed_row(s->hidden, s->w.token_embd, s->w.t_embd, next, E);
+        embed_row(s->hidden, s->w.token_embd, s->w.t_embd, next, E, cfg->n_vocab);
 
         /* Forward pass */
         if (ct_infer_forward(s, total - 1, s->hidden, layer_out) != 0)

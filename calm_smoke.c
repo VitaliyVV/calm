@@ -22,7 +22,7 @@ int main(int argc, char** argv) {
      * vocab=102400 and would read past token_embd). */
     int tok1 = 0;
     printf("\n--- Test 1: Single token (tok=%d) ---\n", tok1);
-    embed_row(s->hidden, s->w.token_embd, s->w.t_embd, tok1, cfg->n_embd);
+    embed_row(s->hidden, s->w.token_embd, s->w.t_embd, tok1, cfg->n_embd, cfg->n_vocab);
     
     /* Verify embedding is sane */
     float sum = 0, max_abs = 0, nan_count = 0;
@@ -59,7 +59,7 @@ int main(int argc, char** argv) {
      * special tokens; 128006 is out of range for vocab=102400. */
     int specl = 100;
     printf("\n--- Test 2: Token %d ---\n", specl);
-    embed_row(s->hidden, s->w.token_embd, s->w.t_embd, specl, cfg->n_embd);
+    embed_row(s->hidden, s->w.token_embd, s->w.t_embd, specl, cfg->n_embd, cfg->n_vocab);
     sum = 0; max_abs = 0; nan_count = 0;
     for (int i = 0; i < cfg->n_embd; i++) {
         sum += s->hidden[i];
@@ -73,7 +73,22 @@ int main(int argc, char** argv) {
         printf("FAIL: embedding has NaN or extreme values\n");
         return 1;
     }
-    
+
+    /* Test 3: OOB token — embed_row must zero-fill + return -1,
+     * NOT read past the end of token_embd. */
+    printf("\n--- Test 3: OOB token (tok=%d, vocab=%d) ---\n",
+           cfg->n_vocab + 7, cfg->n_vocab);
+    for (int i = 0; i < cfg->n_embd; i++) s->hidden[i] = 123.0f; /* poison */
+    int rc = embed_row(s->hidden, s->w.token_embd, s->w.t_embd,
+                       cfg->n_vocab + 7, cfg->n_embd, cfg->n_vocab);
+    float oob_sum = 0;
+    for (int i = 0; i < cfg->n_embd; i++) oob_sum += s->hidden[i];
+    printf("  rc=%d emb_sum=%.2f (expect rc=-1, sum=0)\n", rc, oob_sum);
+    if (rc != -1 || oob_sum != 0.0f) {
+        printf("FAIL: OOB token not guarded\n");
+        return 1;
+    }
+
     printf("\nPASS\n");
     ct_infer_free(s);
     ct_gguf_close(gguf);

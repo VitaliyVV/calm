@@ -144,7 +144,7 @@ int main(int argc, char** argv) {
     int start_token = 1; /* BOS */
     /* Check token_embd table health */
     float test_vec[32];
-    embed_row(test_vec, s->w.token_embd, s->w.t_embd, 0, 32);
+    embed_row(test_vec, s->w.token_embd, s->w.t_embd, 0, 32, cfg->n_vocab);
     float t_min = INFINITY, t_max = -INFINITY; int t_nan = 0;
     for (int i = 0; i < 32; i++) {
         if (isnan(test_vec[i])) t_nan++;
@@ -152,7 +152,7 @@ int main(int argc, char** argv) {
         if (test_vec[i] > t_max) t_max = test_vec[i];
     }
     printf("  token_embd[0][0..31]: nan=%d range=[%e, %e]\n", t_nan, t_min, t_max);
-    embed_row(test_vec, s->w.token_embd, s->w.t_embd, 1, 32);
+    embed_row(test_vec, s->w.token_embd, s->w.t_embd, 1, 32, cfg->n_vocab);
     t_min = INFINITY; t_max = -INFINITY; t_nan = 0;
     for (int i = 0; i < 32; i++) {
         if (isnan(test_vec[i])) t_nan++;
@@ -174,7 +174,7 @@ int main(int argc, char** argv) {
     for (int pos = 0; pos < n_gen; pos++) {
         /* Embed current token */
         embed_row(hidden, s->w.token_embd, s->w.t_embd,
-                  pos == 0 ? start_token : 0, E);
+                  pos == 0 ? start_token : 0, E, cfg->n_vocab);
 
         /* Forward pass */
         clock_t t0 = clock();
