@@ -106,9 +106,12 @@ static void mla_forward_f32(float* buf_q, const float* normed,
         matmul(kv_a_buf, normed, lw->attn_kv_a, lw->t_kva, E, dc + dr);
     }
 
-    /* KV latent norm (applied to full latent before splitting) */
+    /* KV latent norm — applied ONLY to the kv_nope part [dc].
+     * Weight dims = kv_lora_rank (verified on real GGUF: attn_kv_a_norm = [512]).
+     * The rope part (k_pe, last dr elements) must NOT be normalized —
+     * HF DeepseekV2RMSNorm(kv_lora_rank) applies only to kv_nope. */
     if (lw->attn_kv_a_norm) {
-        rms_norm(kv_a_buf, kv_a_buf, lw->attn_kv_a_norm, dc + dr, cfg->norm_rms_eps);
+        rms_norm(kv_a_buf, kv_a_buf, lw->attn_kv_a_norm, dc, cfg->norm_rms_eps);
     }
 
     const float* c = kv_a_buf;
@@ -324,9 +327,10 @@ static void mla_forward_general(float* buf_q, const float* normed,
         matmul(kv_a_buf, normed, lw->attn_kv_a, lw->t_kva, E, dc + dr);
     }
 
-    /* KV latent norm over the full latent [dc+dr] (matches F32 path and llama.cpp) */
+    /* KV latent norm over the kv_nope part [dc] only (matches F32 path and HF).
+     * attn_kv_a_norm weight dims = kv_lora_rank; rope part (k_pe) unnormalized. */
     if (lw->attn_kv_a_norm) {
-        rms_norm(kv_a_buf, kv_a_buf, lw->attn_kv_a_norm, dc + dr, cfg->norm_rms_eps);
+        rms_norm(kv_a_buf, kv_a_buf, lw->attn_kv_a_norm, dc, cfg->norm_rms_eps);
     }
 
     const float* c = kv_a_buf;

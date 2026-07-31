@@ -63,7 +63,7 @@ static float g_qw[E * H * HD];                    /* fused Q  [E, H*hd] */
 static float g_kva_w[E * (DC + DR)];              /* KV latent [E, dc+dr] */
 static float g_kvb_f32[DC * TC];                  /* Wkv_b F32 [dc, total_cols] GGUF layout */
 static char g_q8_buf[TC * (DC / 32) * sizeof(ct_block_q8_0)];
-static float g_kva_norm_w[DC + DR];
+static float g_kva_norm_w[DC];
 static float g_k_norm_w[DN];
 
 /* ── Independent F32 reference ── */
@@ -83,10 +83,11 @@ static void reference_mla(float* out, const float* normed, const ct_infer_layer*
     for (int hh = 0; hh < H; hh++)
         rope(qb + hh * hd + dn, dr, pos, cfg->rope_freq_base);
 
-    /* KV latent + full-latent norm */
+    /* KV latent + kv_a_norm over the kv_nope part [dc] only (matches HF:
+     * DeepseekV2RMSNorm(kv_lora_rank) applies to kv_nope, not to k_pe). */
     matmul(kva, normed, lw->attn_kv_a, CT_GGUF_TYPE_F32, E, dc + dr);
     if (lw->attn_kv_a_norm)
-        rms_norm(kva, kva, lw->attn_kv_a_norm, dc + dr, cfg->norm_rms_eps);
+        rms_norm(kva, kva, lw->attn_kv_a_norm, dc, cfg->norm_rms_eps);
 
     /* Store [c | k_rope] in cache */
     for (int d = 0; d < dc; d++)
@@ -163,7 +164,7 @@ static void init_weights(void) {
     for (int i = 0; i < E * H * HD; i++)            g_qw[i] = frand();
     for (int i = 0; i < E * (DC + DR); i++)         g_kva_w[i] = frand();
     for (int i = 0; i < DC * TC; i++)               g_kvb_f32[i] = frand();
-    for (int i = 0; i < DC + DR; i++)               g_kva_norm_w[i] = 1.0f;
+    for (int i = 0; i < DC; i++)                    g_kva_norm_w[i] = 1.0f;
     for (int i = 0; i < DN; i++)                    g_k_norm_w[i] = 1.0f;
 
     /* Quantize Wkv_b columns to Q8_0 in GGUF layout: block index c*nb + kb */

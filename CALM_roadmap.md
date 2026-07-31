@@ -323,9 +323,9 @@ MLA:                k_latent = x·Wuk (d×d_c),  k = k_latent·Wok (d_c×d_h)
 - [x] **Integrate with Calm MoE**: shared expert добавлен поверх routed experts в MoE-секции forward pass
 - [x] **Quantized Wkv_b в MLA**: блочная деквант-адресация по GGUF layout (блоки вдоль dc; 256 для K-quants, 32 для Q5_0/Q4_1/Q8_0/Q4_0/IQ4_NL), `deq_q8_0_wrap`/`deq_q4_0_wrap` адаптеры
 - [x] **Synthetic MLA test** (`calm_mla_test.c`): F32 + Q8_0 пути против независимого референса, 3 комбо (k_norm/kv_a_norm), DC=64 → 2 блока Q8_0 на колонку — ALL PASS (F32 ~1e-5, Q8_0 в допуске 5%)
-- [ ] **DeepSeerMoE fine-grained routing**: 64 мелких эксперта, top-6 (на базе существующего MoE роутера)
-- [ ] **DeepSeek2 tokenizer**: BPE с специальными токенами (`<｜end▁of▁sentence｜>`, `惜`)
-- [ ] **Real DeepSeek2 GGUF model test**: тестирование на DS-Coder-V2-Lite (GGUF ~4 GB)
+- [x] **DeepSeerMoE fine-grained routing**: 64 мелких эксперта, top-6 (на базе существующего MoE роутера) — подтверждено на реальной модели
+- [x] **Real DeepSeek2 GGUF model test**: DS-Coder-V2-Lite-Instruct Q2_K (6.0 GiB) — загрузка, 27 слоёв, MLA + MoE 64×top-6 + shared 2, генерация текста
+- [ ] **DeepSeek2 tokenizer**: BPE со специальными токенами (`<｜end▁of▁sentence｜>`, `惜`) — токенизатор работает (см. верификацию), спецтокены вне vocab требуют аккуратной обработки
 
 ### Структура DeepSeek-Coder-V2-Lite (16B, MoE)
 ```
@@ -350,21 +350,26 @@ total params: ~15.7B
 - Calm MoE core: уже есть ✅ — router + expert dispatch
 - KV cache: уже есть ✅ — но MLA требует меньший cache (преимущество)
 
-### Статус: ◐ В разработке (1 августа 2026)
+### Статус: ✅ Real model verified (1 августа 2026)
 
 **Реализовано:**
 - `calm_mla.h` / `calm_mla.c` — MLA forward pass с absorption trick (Q_nope @ Wk_b → absorbed_q, weighted latent sum → V)
 - `calm_infer.h` — MLA config поля (kv_lora_rank, q_lora_rank, qk_nope_head_dim, qk_rope_head_dim, v_head_dim, n_shared_expert), MLA weights (attn_q_a/b, attn_kv_a/b, norm), MLA KV cache (mla_kv_cache)
 - `calm_infer.c` — MLA детекция через `attn_kv_a.weight`, weight loading, KV cache alloc, dispatch в forward pass
 - Shared expert (DeepSeekMoE) — weight loading + FFN forward поверх routed MoE
-- **Quantized Wkv_b в MLA absorption loops**: блочная адресация по GGUF layout (блоки вдоль dc), все типы Q2_K…Q8_K + Q5_0/Q4_1/Q8_0/Q4_0/IQ4_NL; `attn_kv_a_norm` нормирует dc+dr; Step 3 k_norm per-head-group с 2D-offset расширением (без переполнения `kv_b_cur[4096]`); деление `dot_nope` на RMS в обоих путях
+- **Quantized Wkv_b в MLA absorption loops**: блочная адресация по GGUF layout (блоки вдоль dc), все типы Q2_K…Q8_K + Q5_0/Q4_1/Q8_0/Q4_0/IQ4_NL; `attn_kv_a_norm` нормирует первые `dc` элементов (вес = kv_lora_rank = 512, см. баг #10); Step 3 k_norm per-head-group с 2D-offset расширением (без переполнения `kv_b_cur[4096]`); деление `dot_nope` на RMS в обоих путях
 - **Исправлены переполнения**: `buf_q_size` в `calm_infer.c` теперь `H*(dn+dr)` при MLA (было 2048, DS-Coder-V2-Lite требует 3072); `mla_cache_dim` + `n_head_kv` строк на слой
 - **Synthetic MLA test** (`calm_mla_test.c`): независимый F32-референс, 3 комбо, F32/Q8_0 пути — ALL PASS (MSVC/AVX2)
+- **Real model test** (1 августа 2026): `DeepSeek-Coder-V2-Lite-Instruct-Q2_K.gguf` (6.0 GiB, 377 тензоров, arch=deepseek2)
+  - Загрузка: 27 слоёв, MLA fused-формат (`attn_kv_a_mqa=[2048,576]` Q2_K, `attn_kv_b=[512,4096]` Q2_K, `attn_output=[2048,2048]` Q3_K, `attn_q=[2048,3072]` Q2_K — q_lora_rank=0 у Lite)
+  - MoE: 64 routed эксперта (3D stacked `ffn_gate_exps=[2048,1408,64]` Q2_K) + 2 shared (`ffn_gate_shexp=[2048,2816]` Q2_K, `ffn_down_shexp=[2816,2048]` Q3_K) + роутер `ffn_gate_inp=[2048,64]` F32
+  - Слой 0 — плотный FFN (leading_dense_block_count=1), слои 1-26 — MoE
+  - Forward всех 27 слоёв: **без NaN/Inf** (max_abs ~1e3)
+  - Генерация: "The capital of France is" → "Paris. Paris is the capital city of France. It is a beautiful city…"
 
 **Осталось:**
-- Тестирование на реальной DeepSeek2 GGUF модели (DS-Coder-V2-Lite-Instruct)
-- DeepSeek2 BPE tokenizer (специальные токены)
-- DeepSeerMoE fine-grained (64 experts, top-6) — существующий MoE роутер должен работать
+- DeepSeek2 BPE tokenizer: специальные токены вне vocab (Llama-совместимые ID 128000/128006 недопустимы при vocab=102400 — проверять границы)
+- Оптимизация скорости (MoE streaming, top-6, память)
 
 ### Новые файлы (~250 строк)
 - `calm_mla.h` — декларация `ct_forward_mla()`
@@ -410,7 +415,7 @@ total params: ~15.7B
 10. ✅ **GGUF→TQ1_0/BQ1_0 конвертер** — `calm_convert.c`
 11. ◐ **Phase 6: GGUF→GGUF Requantizer** — streaming core ✅, dequant F32/F16/Q8_0/Q4_0/Q4_1/Q5_0/Q5_1/Q2_K/Q4_K/Q5_K/Q6_K ✅, остались IQ форматы
 12. ✅ **Phase 7: SSM Forward Pass** — Mamba-style selective scan для Qwen3.5/Jamba/Ornith гибридов
-13. ◐ **Phase 8: DeepSeek2 (MLA+MoE)** — Multi-head Latent Attention + DeepSeekMoE (forward pass integrated; quantized Wkv_b блочная адресация + k_norm/kv_a_norm фиксы + переполнения буферов исправлены; synthetic MLA test ALL PASS — F32/Q8_0 против референса; осталось: токенизатор, MoE 64×top-6, реальная модель)
+13. ✅ **Phase 8: DeepSeek2 (MLA+MoE)** — Multi-head Latent Attention + DeepSeekMoE (forward pass integrated; quantized Wkv_b блочная адресация + kv_a_norm dc-only фикс + переполнения буферов исправлены; synthetic MLA test ALL PASS; **реальная модель DS-Coder-V2-Lite Q2_K (6 GiB) загружается, 27 слоёв без NaN, генерация текста работает**; осталось: спецтокены BPE, оптимизация)
 14. ◐ **Phase 9: x86/AVX2** — AVX2 matmul Q8_0/Q4_0/BQ1_0/TQ1_0 ✅, dequant/quant ✅, Makefile x86 ◐, CPUID Windows 🔲
 15. 📦 **mmap/expert streaming** — Colibri-style, холодные эксперты с диска
 16. 📦 **Qwen3.6 архитектура** — для запуска Bonsai-27B (1-bit, 3.9 GB) — зависит от Phase 7
@@ -808,11 +813,11 @@ DeepSeek-V3-671B     BQ1_0    94 GB  ❌ (не влезет)
 
 **Фикс:** `calm_mla.c` — адресация по GGUF layout: `block index = c*nb + kb`, `nb = ceil(dc/block)`, `block_stride = ct_gguf_tensor_size(type, 1, {block})`; `block` = 256 (K-quants) / 32 (Q8_0, Q4_0, Q5_0, Q4_1, IQ4_NL). Q8_0/Q4_0 добавлены в диспетчер через `deq_q8_0_wrap`/`deq_q4_0_wrap` (адаптеры под `(block, out, count)` сигнатуру).
 
-### 6. `attn_kv_a_norm` нормировал только `dc` вместо `dc+dr`
+### 6. `attn_kv_a_norm` — расхождение путей, затем неверный фикс dc+dr (исправлено в #10)
 
-**Причина:** general path нормировал первые `dc` элементов латента, F32 path — все `dc+dr`. Расхождение путей → разные scores при включённой `attn_kv_a_norm`.
+**Причина:** general path нормировал первые `dc` элементов латента, F32 path — все `dc+dr`. Промежуточный фикс выровнял оба пути на `dc+dr` — это оказалось **неверно**: вес `attn_kv_a_norm.weight` имеет размер `kv_lora_rank` (512), а не `dc+dr` (576). Нормировка `dc+dr` читала 64 флоата за концом тензора + портила rope-часть (k_pe).
 
-**Фикс:** `calm_mla.c` — `rms_norm(..., dc + dr, ...)` в general path (совпадает с F32 path и llama.cpp).
+**Итоговый фикс (#10):** `calm_mla.c` — оба пути (`F32` и `Q8`) нормируют только первые `dc` элементов: `rms_norm(kv_a_buf, kv_a_buf, lw->attn_kv_a_norm, dc, ...)`. Соответствует HF: `DeepseekV2RMSNorm(kv_lora_rank)` применяется только к `kv_nope`; `k_pe` не нормализуется. Подтверждено реальным GGUF (dims=[512]).
 
 ### 7. Step 3 k_norm — переполнение `kv_b_cur[4096]` + неверная семантика
 
@@ -832,7 +837,22 @@ DeepSeek-V3-671B     BQ1_0    94 GB  ❌ (не влезет)
 
 **Фикс:** `calm_mla_test.c` — `ct_quant_init()` в `main()`.
 
+### 10. `attn_kv_a_norm` — OOB чтение + порча k_pe (реальная модель, 1 августа 2026)
+
+**Причина:** `rms_norm(..., dc + dr = 576, ...)` при весе `attn_kv_a_norm.weight = [512]` (= kv_lora_rank). Реальный GGUF-дампер подтвердил: dims=[512], тип F32, size=2048 байт. Чтение 64 флоатов за концом тензора (соседний `attn_kv_a_mqa`), плюс неверная нормализация rope-части. Синтетический тест не ловил: `g_kva_norm_w[DC+DR]` и референс зеркалили ту же неверную конвенцию.
+
+**Симптом:** на реальной модели значения нормированного латента искажены; smoke-тест выдавал гигантские эмбеддинги (max_abs=68628) из-за OOB чтения token_embd (см. #11) и неверных норм.
+
+**Фикс:** оба пути (`F32` и `Q8`) в `calm_mla.c` нормализуют только первые `dc` элементов. Тест-референс `calm_mla_test.c` приведён к HF-конвенции, `g_kva_norm_w` уменьшен до `[DC]`.
+
+### 11. calm_smoke: токены Llama вне vocab DeepSeek (тест, 1 августа 2026)
+
+**Причина:** `calm_smoke.c` хардкодил токены Llama (BOS=128000, спецтокен 128006), но у DS-Coder-V2-Lite vocab=102400. `embed_row` читала строки за концом `token_embd` (размер 68.8 MB, тензоры-соседи → значения 334944×3 одинаковых) — ложный FAIL.
+
+**Фикс:** `calm_smoke.c` — валидные токены 0 и 100. Проверка границ vocab в `embed_row` — рекомендация на будущее.
+
 **Верификация (1 августа 2026, MSVC/AVX2, `/W4` 0 предупреждений):**
 - `calm_mla_test.exe`: F32 vs референс max_abs 1.9e-5 / 1.3e-5 / 5.7e-6; Q8_0 vs референс 0.54 / 0.26 / 0.11 (допуск 5%) — **ALL PASS**, 3 комбо (k_norm/kv_a_norm), Q8_0 roundtrip max_err 8.1e-3
 - `calm_smoke.exe` (MSVC/Windows): PASS на Llama-3.2-1B Q8_0 и qwen2.5-0.5b Q4_0 — без NaN/Inf
+- **Real model** (1 августа 2026): `calm_smoke.exe` + `calm run` (make x86) на `DeepSeek-Coder-V2-Lite-Instruct-Q2_K.gguf` (6.0 GiB, 27 слоёв): emb sane (sum -8.1, max_abs 1.2), все 27 слоёв без NaN (max_abs ~1e3), генерация: "The capital of France is" → "Paris. Paris is the capital city of France. It is a beautiful city…"
 - Коммит `48cb791`: 4 файла, +408/−72

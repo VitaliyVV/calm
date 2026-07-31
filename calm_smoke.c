@@ -17,10 +17,12 @@ int main(int argc, char** argv) {
            cfg->n_layer, cfg->n_embd, cfg->n_head, cfg->n_head_kv,
            cfg->head_dim, cfg->n_ff, cfg->n_vocab);
     
-    /* Test 1: single token (BOS) */
-    int bos = 128000; /* Llama BOS */
-    printf("\n--- Test 1: Single token (BOS=%d) ---\n", bos);
-    embed_row(s->hidden, s->w.token_embd, s->w.t_embd, bos, cfg->n_embd);
+    /* Test 1: single token — use token 0 (valid for any vocab; DeepSeek:
+     * BOS is a real vocab entry, while 128000 is out of range for
+     * vocab=102400 and would read past token_embd). */
+    int tok1 = 0;
+    printf("\n--- Test 1: Single token (tok=%d) ---\n", tok1);
+    embed_row(s->hidden, s->w.token_embd, s->w.t_embd, tok1, cfg->n_embd);
     
     /* Verify embedding is sane */
     float sum = 0, max_abs = 0, nan_count = 0;
@@ -53,9 +55,10 @@ int main(int argc, char** argv) {
         return 1;
     }
     
-    /* Test 2: special token (<|start_header_id|> for Llama) */
-    int specl = 128006;
-    printf("\n--- Test 2: Special token (%d) ---\n", specl);
+    /* Test 2: another valid token (100) — DeepSeek vocab has no Llama
+     * special tokens; 128006 is out of range for vocab=102400. */
+    int specl = 100;
+    printf("\n--- Test 2: Token %d ---\n", specl);
     embed_row(s->hidden, s->w.token_embd, s->w.t_embd, specl, cfg->n_embd);
     sum = 0; max_abs = 0; nan_count = 0;
     for (int i = 0; i < cfg->n_embd; i++) {
