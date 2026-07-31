@@ -29,20 +29,22 @@ extern "C" {
 #define CT_SIZEOF_Q4_0  18   /* uint16 + uint8[16] */
 #define CT_SIZEOF_BQ1_0 18   /* uint64[2] + uint16 */
 #define CT_SIZEOF_TQ1_0 54   /* uint8[48] + uint8[4] + uint16 */
+#define CT_SIZEOF_IQ4_NL 18  /* uint16 + uint8[16] = 18 bytes per 32-element block */
 
 /* Q8_0: 32 elements per block, FP16 scale + 8-bit values */
 #define CT_QK8_0 32
+#pragma pack(push, 1)  /* portable packing: MSVC (cl) + GCC/Clang */
 typedef struct {
     uint16_t d;        /* FP16 scale (delta) */
     int8_t   qs[32];   /* quantized values */
-} __attribute__((packed)) ct_block_q8_0;
+} ct_block_q8_0;
 
 /* Q4_0: 32 elements per block, FP16 scale + packed nibbles */
 #define CT_QK4_0 32
 typedef struct {
     uint16_t d;        /* FP16 scale (delta) */
     uint8_t  qs[16];   /* packed nibbles (2 values per byte) */
-} __attribute__((packed)) ct_block_q4_0;
+} ct_block_q4_0;
 
 /* BQ1_0: binary 1-bit, 128 weights per group
  * 128 weights packed as 128 bits (2× uint64), 1 FP16 scale per group
@@ -52,7 +54,7 @@ typedef struct {
 typedef struct {
     uint64_t bits[2];  /* 128 bits: bit=0 → −scale, bit=1 → +scale */
     uint16_t d;         /* FP16 scale for this group */
-} __attribute__((packed)) ct_block_bq1_0;
+} ct_block_bq1_0;
 
 /* TQ1_0: ternary 1.58-bit, 256 weights per block
  * base-3 packing: 5 ternary values per byte (3^5=243 fits in 1 byte)
@@ -64,7 +66,18 @@ typedef struct {
     uint8_t  qs[48];    /* (256-16)/5 = 48 bytes: 240 values in base-3 */
     uint8_t  qh[4];     /* 4 bytes: remaining 16 values (4 per byte) */
     uint16_t d;          /* FP16 scale */
-} __attribute__((packed)) ct_block_tq1_0;
+} ct_block_tq1_0;
+
+/* IQ4_NL: 32 elements per block, FP16 scale + packed 4-bit values
+ * Upstream ggml type ID 20. Used by ffn_down in some quantized models.
+ * Dequant: out[i] = d * (nibble - 8)
+ */
+#define CT_IQ4_NL_BLOCK_SIZE 32
+typedef struct {
+    uint16_t d;        /* FP16 scale */
+    uint8_t  qs[16];   /* packed signed 4-bit nibbles (2 per byte) */
+} ct_block_iq4_nl;
+#pragma pack(pop)
 
 /* ═══════════════════════════════════════════════════════════════
  * FP16 conversion (inlined for performance)

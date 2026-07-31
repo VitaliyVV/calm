@@ -44,6 +44,8 @@ typedef enum {
     CT_GGUF_TYPE_IQ3_S   = 33,
     CT_GGUF_TYPE_IQ4_NL  = 34,
     CT_GGUF_TYPE_IQ4_XS  = 35,
+    /* Upstream GGUF type IDs (used by models quantized with upstream llama.cpp/ggml) */
+    CT_GGUF_TYPE_IQ4_NL_STD = 20,  /* upstream ID for IQ4_NL, needed for ffn_down in Q2_K models */
     /* Custom Calm formats (negative to avoid collision with GGUF) */
     CT_GGUF_TYPE_BQ1_0   = 64,
     CT_GGUF_TYPE_TQ1_0   = 65,

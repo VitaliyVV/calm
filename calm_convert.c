@@ -65,6 +65,21 @@ static bool is_head_tensor(const char* name) {
     return false;
 }
 
+/* Extract layer number from tensor name like "blk.7.attn_q.weight" → 7.
+ * Returns -1 if the name doesn't match blk.N.* pattern. */
+static int get_layer_number(const char* name) {
+    if (!name) return -1;
+    if (strncmp(name, "blk.", 4) != 0) return -1;
+    const char* p = name + 4;
+    int n = 0;
+    while (*p >= '0' && *p <= '9') {
+        n = n * 10 + (*p - '0');
+        p++;
+    }
+    if (*p != '.') return -1;
+    return n;
+}
+
 /* ═══════════════════════════════════════════════════════════════
  * K-Quant Dequantization (proper dequant for all K-quant types)
  *
@@ -72,56 +87,50 @@ static bool is_head_tensor(const char* name) {
  * K-quant blocks → float for re-quantization.
  * ═══════════════════════════════════════════════════════════════ */
 
-/* Q2_K: 2-bit, 256-element super-blocks
- *   16 sub-blocks of 16 elements, each with 6-bit scale (d + dmin)
- *   Structure: d(F16) dmin(F16) scales[12] qs[64]
- *   size = 80 bytes per 256 elements = 0.3125 bpw
+/* Q2_K: 2-bit, 256-element super-blocks (block_q2_K, llama.cpp)
+ *   16 sub-blocks of 16 elements, each with 4-bit scale + 4-bit min
+ *   Structure: scales[16] + qs[64] + d(F16) + dmin(F16) = 84 bytes
+ *   qs: stride-32 interleave — byte (g*32+r) holds 4 values, column c at bits (c*2).
  */
 static void dequant_q2_k(const uint8_t* data, float* out, int cols, int blk_idx) {
-    const uint16_t* d16 = (const uint16_t*)data;
-    float d   = ct_fp16_to_fp32(d16[0]);
-    float dmin = ct_fp16_to_fp32(d16[1]);
-    const uint8_t* scales = data + 4;
-    const uint8_t* qs = data + 16;  // 2-bit, 4 per byte → 64 bytes
+    const uint8_t* scales = data;          /* 16 bytes: 4-bit scale + 4-bit min per sub-block */
+    const uint8_t* qs = data + 16;         /* 64 bytes: 2-bit quants */
+    float d    = ct_fp16_to_fp32(*(const uint16_t*)(data + 80)); /* d last (llama.cpp) */
+    float dmin = ct_fp16_to_fp32(*(const uint16_t*)(data + 82)); /* dmin last */
     int base = blk_idx * 256;
 
-    // 16 sub-blocks of 16 elements each
     for (int sb = 0; sb < 16; sb++) {
-        // Scale decoding: 6 bits per sub-block, packed in 12 bytes
-        int sc_byte = (sb * 6) / 8;
-        int sc_bit  = (sb * 6) % 8;
-        int sc_raw = ((scales[sc_byte] >> sc_bit) |
-                     (scales[sc_byte + 1] << (8 - sc_bit))) & 0x3F;
-        float sub_d = d * ((float)sc_raw - 16);
-        float sub_m = dmin * ((float)sc_raw - 16);
-
+        float dl = d    * (float)(scales[sb] & 0x0F);
+        float ml = dmin * (float)(scales[sb] >> 4);
         for (int j = 0; j < 16; j++) {
-            int idx = sb * 16 + j;
-            if (base + idx >= cols) return;
-            int byte_idx = idx / 4;
-            int bit_shift = (idx % 4) * 2;
-            int qv = (qs[byte_idx] >> bit_shift) & 3;
-            out[base + idx] = qv * sub_d + sub_m;
+            int idx = base + sb * 16 + j;
+            if (idx >= cols) return;
+            int g = (sb * 16 + j) / 128;        /* 0 or 1 */
+            int r = (sb * 16 + j) % 32;         /* row within group */
+            int c = ((sb * 16 + j) % 128) / 32; /* column 0..3 */
+            int qv = (qs[g * 32 + r] >> (c * 2)) & 3;
+            out[idx] = (float)qv * dl - ml;
         }
     }
 }
 
-/* Q3_K: 3-bit, 256-element super-blocks
- *   Layout: d(F16,2B) + dmin(F16,2B) + hmask[4] + qs[96] + scales[12] = 116B
- *   qs: 2-bit low bits packed 4/byte
+/* Q3_K: 3-bit, 256-element super-blocks (block_q3_K, llama.cpp)
+ *   Layout: hmask[32] + qs[64] + scales[12] + d(F16,2B) = 110B
+ *   qs: 2-bit low bits, stride-32 interleave (4 values per byte, 2 bits each)
  *   hmask: 1-bit high bit per element (bit=0 → subtract 4, making 3-bit signed)
- *   scales[12]: 16 × 6-bit values unpacked to int8[d-scale-8, dmin-scale-8]
- *   NOTE: dmin IS stored in the block but the llama.cpp dequant only uses d_all.
+ *   scales[12]: 16 × 6-bit values unpacked to int8, centered at 32
+ *   d: FP16 super-block scale (first 2 bytes)
  */
 static void dequant_q3_k(const uint8_t* data, float* out, int cols, int blk_idx) {
-    float d_all = ct_fp16_to_fp32(*(const uint16_t*)(data));
-    const uint8_t* hm = data + 4;    // hmask: 4 bytes
-    const uint8_t* q = data + 8;     // qs: 96 bytes
+    const uint8_t* hm = data;              /* hmask: 32 bytes (first) */
+    const uint8_t* q = data + 32;          /* qs: 64 bytes */
+    const uint8_t* scales = data + 96;     /* scales: 12 bytes */
+    float d_all = ct_fp16_to_fp32(*(const uint16_t*)(data + 108)); /* d last */
     int base = blk_idx * 256;
 
-    // Unpack scales[12] → 16 int8 values (llama.cpp algorithm)
+    /* Unpack scales[12] → 16 int8 values (llama.cpp algorithm) */
     uint32_t aux[4];
-    memcpy(aux, data + 104, 12);
+    memcpy(aux, scales, 12);
     const uint32_t kmask1 = 0x03030303;
     const uint32_t kmask2 = 0x0f0f0f0f;
     uint32_t tmp = aux[2];
@@ -129,215 +138,154 @@ static void dequant_q3_k(const uint8_t* data, float* out, int cols, int blk_idx)
     aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
     aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
     aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
-    const int8_t* scales = (const int8_t*)aux;
+    const int8_t* sc = (const int8_t*)aux;
 
     int is = 0;
-    for (int n = 0; n < 256; n += 128) {
+    uint8_t m = 1; /* bit advances across BOTH 128-groups: 1,2,4,8,16,32,64,128 */
+    for (int g = 0; g < 2; g++) {
         int shift = 0;
+        int q_off = g * 32;
         for (int j = 0; j < 4; j++) {
-            float dl = d_all * (float)(scales[is++] - 32);
+            float dl = d_all * (float)(sc[is++] - 32);
             for (int l = 0; l < 16; l++) {
-                int idx = base + n + j * 32 + l;
+                int idx = base + g * 128 + j * 32 + l;
                 if (idx >= cols) return;
-                int qval = (q[l] >> shift) & 3;
-                if (!(hm[l] & (1u << j))) qval -= 4;
-                out[idx] = dl * (float)qval;
+                int low = (q[q_off + l] >> shift) & 3;
+                int high = (hm[l] & m) ? 1 : 0;
+                out[idx] = dl * (float)(low - (high ? 0 : 4));
             }
-            dl = d_all * (float)(scales[is++] - 32);
+            dl = d_all * (float)(sc[is++] - 32);
             for (int l = 0; l < 16; l++) {
-                int idx = base + n + j * 32 + 16 + l;
+                int idx = base + g * 128 + j * 32 + 16 + l;
                 if (idx >= cols) return;
-                int qval = (q[l + 16] >> shift) & 3;
-                if (!(hm[l + 16] & (1u << j))) qval -= 4;
-                out[idx] = dl * (float)qval;
+                int low = (q[q_off + 16 + l] >> shift) & 3;
+                int high = (hm[16 + l] & m) ? 1 : 0;
+                out[idx] = dl * (float)(low - (high ? 0 : 4));
             }
             shift += 2;
+            m <<= 1;
         }
-        q += 32;
     }
 }
 
-/* Q8_K: 8-bit, 128-element super-blocks
- *   Layout: d(F16,2B) + qs[128] = 130 bytes
- *   Single scale d for all 128 values
+/* Q8_K: 8-bit, 256-element super-blocks (llama.cpp block_q8_K)
+ *   Layout: d(F32,4B) + qs[256] + bsums[16] = 292 bytes
+ *   Single scale d for all 256 values
  */
 static void dequant_q8_k(const uint8_t* data, float* out, int cols, int blk_idx) {
-    float d = ct_fp16_to_fp32(*(const uint16_t*)(data));
-    const int8_t* qs = (const int8_t*)(data + 2);
-    int base = blk_idx * 128;
-    for (int j = 0; j < 128; j++) {
+    float d = *(const float*)(data);
+    const int8_t* qs = (const int8_t*)(data + 4);
+    int base = blk_idx * 256;
+    for (int j = 0; j < 256; j++) {
         int idx = base + j;
         if (idx >= cols) return;
         out[idx] = (float)qs[j] * d;
     }
 }
 
-/* Q4_K: 4-bit, 256-element super-blocks (most common: Q4_K_M, Q4_K_S)
- *   8 sub-blocks of 32 elements, 6-bit scale per sub-block
- *   Structure: d(F16) dmin(F16) scales[12] qs[128]
- *   size = 144 bytes per 256 elements = 0.5625 bpw
- *
- *   Scale layout: 12 bytes, each sub-block gets 6 bits
- *   Sub-blocks 0-3: bytes 0-8 (6 bits each, overlapping byte boundaries)
- *   Sub-blocks 4-7: bytes 6-11
+/* Q4_K: 4-bit, 256-element super-blocks (block_q4_K, llama.cpp)
+ *   Layout: d(F16,2B) dmin(F16,2B) scales[12] qs[128] = 144 bytes
+ *   4 groups of 64; each group: 32 low-nibble + 32 high-nibble values
+ *   scales[12]: 8 × 6-bit (scale+min) pairs via k4_get_scale_min, NO -16 offset
  */
-static void dequant_q4_k(const uint8_t* data, float* out, int cols, int blk_idx) {
-    const uint16_t* d16 = (const uint16_t*)data;
-    float d   = ct_fp16_to_fp32(d16[0]);
-    float dmin = ct_fp16_to_fp32(d16[1]);
-    const uint8_t* scales = data + 4;
-    const uint8_t* qs = data + 16;  // 4-bit, 2 per byte → 128 bytes
-    int base = blk_idx * 256;
-
-    // 8 sub-blocks of 32 elements
-    // Scales: 6-bit each, packed in 12 bytes (bytes 0-5 for first 8 scales? actually complex)
-    // llama.cpp reference: scales[12] = 8 × 6-bit values packed as:
-    //   scales[0..5] contain lower bits, scales[6..11] contain upper bits
-    // Actually in Q4_K: 6 bytes for lower 6 bits, 6 bytes for upper bits... no
-    // Let me use the correct llama.cpp Q4_K scale layout.
-    //
-    // Q4_K scale layout (from llama.cpp source):
-    //   8 sub-blocks, each with 6-bit scale
-    //   Packed as 12 bytes: bytes 0-5 contain 8 lower 6-bit fields,
-    //   bytes 6-11 contain 8 upper 6-bit fields
-    //   Actually, no — 8 × 6 bits = 48 bits = 6 bytes, so all fit in 6 bytes
-    //   But there are 2 sets per super-block? Let me re-check.
-    //
-    // After studying llama.cpp ggml-quants.c more carefully:
-    //   Q4_K has 256 elements in a super-block, divided into 8 sub-blocks of 32
-    //   Each sub-block has a 6-bit scale lookup: sc = (scales[sc_byte] >> sc_bit) & 0x3F
-    //   8 × 6 = 48 bits → 6 bytes for scales
-    //   But there's also 8 "min" scales? No, dmin and d are per super-block
-    //   The 6-bit scales index into [d, dmin] range
-    //
-    // Actually from ggml-quants.c:
-    //   For Q4_K: each super-block has 8 sub-blocks of 32 elements
-    //   scales[12] layout: lower 6 bytes = lower 6 bits of 8 sub-block scales
-    //                       upper 6 bytes = upper 6 bits of 8 sub-block scales
-    //   Actually let me just use a simplified version that works for conversion:
-    //   8 × 6-bit values packed in 6 bytes = 48 bits = 6 bytes
-    //   The second set of 6 bytes (scales+6) encodes 8 more values? No, that's Q5_K.
-    
-    // For Q4_K: scales[12] has 8 × 6-bit values in first 6 bytes,
-    //           bytes 6-11 are not used in Q4_K (they're for Q5_K's extra bit)
-    // Actually from llama.cpp ggml-quants.c line ~2500:
-    //   Q4_K: type4_q4_k = { half d; half dmin; uint8_t scales[6]; uint8_t qs[128]; }
-    //   Wait that's only 6 scales? No...
-    //   
-    // OK let me just look at the actual llama.cpp layout from the struct definition:
-    //   block_q4_K: half d; half dmin; uint8_t scales[12]; uint8_t qs[128];
-    //   Scales: 6 bits per sub-block, 8 sub-blocks, packed in 12 bytes
-    //   The 12 bytes are organized as:
-    //     sc[0..5]: lower 6 bits of each sub-block scale (bytes 0-5)
-    //     sc[6..11]: upper 6 bits of each sub-block scale (bytes 6-11) — NO, that doesn't work
-    //
-    // Actually, llama.cpp packs 8 6-bit values into 6 bytes like this:
-    //   scale[0]  = (sc[0] | (sc[1]<<8)) & 0x3F
-    //   scale[1]  = (sc[1]>>6 | sc[2]<<2) & 0x3F
-    //   ... etc
-    // But there are 12 bytes of scales, not 6! The second half is for min scales? No...
-    //
-    // In newer llama.cpp, the 12 bytes pack 16 sub-block scales (8 for d, 8 for dmin)
-    // using 6 bits each: 16 × 6 = 96 bits = 12 bytes
-    // 
-    // So: bytes 0-5  → 8 scales for 8 sub-blocks (d-based)
-    //     bytes 6-11 → 8 minscales for 8 sub-blocks (dmin-based)
-    
-    for (int sb = 0; sb < 8; sb++) {
-        // Decode 6-bit scale from first 6 bytes
-        int sc_byte0 = (sb * 6) / 8;
-        int sc_bit0  = (sb * 6) % 8;
-        int sc_val = (scales[sc_byte0] >> sc_bit0) |
-                     (scales[sc_byte0 + 1] << (8 - sc_bit0));
-        sc_val &= 0x3F;
-        float sc_d  = d * ((float)sc_val - 16);
-        float sc_m  = dmin * ((float)sc_val - 16);
-
-        // Decode 6-bit minscale from bytes 6-11
-        int sc_byte1 = 6 + (sb * 6) / 8;
-        int sc_bit1  = (sb * 6) % 8;
-        int sc_mval  = (scales[sc_byte1] >> sc_bit1) |
-                       (scales[sc_byte1 + 1] << (8 - sc_bit1));
-        sc_mval &= 0x3F;
-        float sc_dmin = d * ((float)sc_mval - 16);
-        float sc_mmin = dmin * ((float)sc_mval - 16);
-
-        for (int j = 0; j < 32; j++) {
-            int idx = sb * 32 + j;
-            if (base + idx >= cols) return;
-            int byte_idx = idx / 2;
-            int nib_shift = (idx & 1) ? 4 : 0;
-            int qv = (qs[byte_idx] >> nib_shift) & 0xF;
-            // Which scale to use depends on a flag we can't easily detect.
-            // We use a heuristic: the first few sub-blocks usually use d,
-            // but the exact assignment depends on Q4_K vs Q4_K_S.
-            // For reasonable accuracy, use sc_d/sc_m (d-based).
-            (void)sc_dmin;
-            (void)sc_mmin;
-            out[base + idx] = qv * sc_d + sc_m;
-        }
+static inline void k4_get_scale_min(int j, const uint8_t* q,
+                                    uint8_t* d, uint8_t* m) {
+    if (j < 4) {
+        *d = q[j] & 63; *m = q[j + 4] & 63;
+    } else {
+        *d = (q[j+4] & 0xF) | ((q[j-4] >> 6) << 4);
+        *m = (q[j+4] >>  4) | ((q[j-0] >> 6) << 4);
     }
 }
 
-/* Q5_K: 5-bit, 256-element super-blocks
- *   8 sub-blocks of 32 elements
- *   Structure: d(F16) dmin(F16) qh[16] scales[12] qs[128]
- *   size = 160 bytes per 256 elements = 0.625 bpw
+static void dequant_q4_k(const uint8_t* data, float* out, int cols, int blk_idx) {
+    float d    = ct_fp16_to_fp32(*(const uint16_t*)(data + 0));
+    float dmin = ct_fp16_to_fp32(*(const uint16_t*)(data + 2));
+    const uint8_t* scales = data + 4;   /* 12 bytes */
+    const uint8_t* q = data + 16;       /* 128 bytes: 4-bit, 2 per byte */
+    int base = blk_idx * 256;
+
+    int is = 0;
+    for (int g = 0; g < 4; g++) {
+        uint8_t sc, m;
+        k4_get_scale_min(is + 0, scales, &sc, &m);
+        float d1 = d * (float)sc; float m1 = dmin * (float)m;
+        k4_get_scale_min(is + 1, scales, &sc, &m);
+        float d2 = d * (float)sc; float m2 = dmin * (float)m;
+        for (int l = 0; l < 32; l++) {
+            int idx = base + g * 64 + l;
+            if (idx >= cols) return;
+            out[idx] = d1 * (float)(q[l] & 0xF) - m1;
+        }
+        for (int l = 0; l < 32; l++) {
+            int idx = base + g * 64 + 32 + l;
+            if (idx >= cols) return;
+            out[idx] = d2 * (float)(q[l] >> 4) - m2;
+        }
+        q += 32; is += 2;
+    }
+}
+
+/* Q5_K: 5-bit, 256-element super-blocks (block_q5_K, llama.cpp)
+ *   Layout: d(F16,2B) dmin(F16,2B) scales[12] qh[16] qs[128] = 176 bytes
+ *   4 groups of 64; qh: 1 high bit per element (u1/u2 masks shift by 2 per group)
  */
 static void dequant_q5_k(const uint8_t* data, float* out, int cols, int blk_idx) {
-    const uint16_t* d16 = (const uint16_t*)data;
-    float d   = ct_fp16_to_fp32(d16[0]);
-    float dmin = ct_fp16_to_fp32(d16[1]);
-    const uint8_t* qh = data + 4;       // 16 bytes of high bits (1 per element)
-    const uint8_t* scales = data + 20;  // 12 bytes (same format as Q4_K)
-    const uint8_t* qs = data + 32;      // 4-bit low bits → 128 bytes
+    float d    = ct_fp16_to_fp32(*(const uint16_t*)(data + 0));
+    float dmin = ct_fp16_to_fp32(*(const uint16_t*)(data + 2));
+    const uint8_t* scales = data + 4;   /* 12 bytes */
+    const uint8_t* qh = data + 16;      /* 16 bytes: 1 high bit per element */
+    const uint8_t* ql = data + 48;      /* 128 bytes: 4-bit low nibbles */
     int base = blk_idx * 256;
 
-    for (int sb = 0; sb < 8; sb++) {
-        int sc_byte0 = (sb * 6) / 8;
-        int sc_bit0  = (sb * 6) % 8;
-        int sc_val = (scales[sc_byte0] >> sc_bit0) |
-                     (scales[sc_byte0 + 1] << (8 - sc_bit0));
-        sc_val &= 0x3F;
-        float sc_d = d * ((float)sc_val - 16);
-        float sc_m = dmin * ((float)sc_val - 16);
-
-        for (int j = 0; j < 32; j++) {
-            int idx = sb * 32 + j;
-            if (base + idx >= cols) return;
-            int byte_idx = idx / 2;
-            int nib_shift = (idx & 1) ? 4 : 0;
-            int lo = (qs[byte_idx] >> nib_shift) & 0xF;
-            int hi = (qh[idx / 8] >> (idx % 8)) & 1;
-            int qv = lo | (hi << 4);
-            out[base + idx] = qv * sc_d + sc_m;
+    int is = 0;
+    uint8_t u1 = 1, u2 = 2;
+    for (int g = 0; g < 4; g++) {
+        uint8_t sc, m;
+        k4_get_scale_min(is + 0, scales, &sc, &m);
+        float d1 = d * (float)sc; float m1 = dmin * (float)m;
+        k4_get_scale_min(is + 1, scales, &sc, &m);
+        float d2 = d * (float)sc; float m2 = dmin * (float)m;
+        for (int l = 0; l < 32; l++) {
+            int idx = base + g * 64 + l;
+            if (idx >= cols) return;
+            out[idx] = d1 * (float)((ql[l] & 0xF) + ((qh[l] & u1) ? 16 : 0)) - m1;
         }
+        for (int l = 0; l < 32; l++) {
+            int idx = base + g * 64 + 32 + l;
+            if (idx >= cols) return;
+            out[idx] = d2 * (float)((ql[l] >> 4) + ((qh[l] & u2) ? 16 : 0)) - m2;
+        }
+        ql += 32; is += 2; u1 <<= 2; u2 <<= 2;
     }
 }
 
-/* Q6_K: 6-bit, 256-element super-blocks
- *   Struct: ql[128] (4-bit lower) + qh[64] (2-bit upper) + scales[16] (int8) + d(F16)
- *   16 sub-blocks of 16 elements each, int8 scale per sub-block
- *   size = 210 bytes per 256 elements = 0.820 bpw
- *   Dequant: val = ((nibble | (high<<4)) - 32) * d * scale[sub]
+/* Q6_K: 6-bit, 256-element super-blocks (block_q6_K, llama.cpp)
+ *   Layout: ql[128] qh[64] scales[16] d(F16,2B) = 210 bytes
+ *   2 groups of 128; strided quads: q1=(ql[l]&0xF)|((qh[l]>>0)&3)<<4, ... all -32
+ *   per 128-group: ql+=64, qh+=32, sc+=8
  */
 static void dequant_q6_k(const uint8_t* data, float* out, int cols, int blk_idx) {
-    const uint8_t* ql = data;                     // 128 bytes, 4-bit nibbles
-    const uint8_t* qh = data + 128;                // 64 bytes, 2-bit upper
-    const int8_t* scales = (const int8_t*)(data + 192);  // 16 int8 scales
-    float d = ct_fp16_to_fp32(*(const uint16_t*)(data + 208));  // last 2 bytes
+    const uint8_t* ql = data;                          /* 128 bytes: 4-bit nibbles */
+    const uint8_t* qh = data + 128;                    /* 64 bytes: 2-bit upper */
+    const int8_t*  sc = (const int8_t*)(data + 192);   /* 16 int8 scales */
+    float d = ct_fp16_to_fp32(*(const uint16_t*)(data + 208));
     int base = blk_idx * 256;
 
-    for (int sb = 0; sb < 16; sb++) {
-        float sc_d = d * (float)scales[sb];
-        for (int j = 0; j < 16; j++) {
-            int idx = sb * 16 + j;
-            if (base + idx >= cols) return;
-            int low = (ql[idx / 2] >> ((idx & 1) << 2)) & 0xF;
-            int high = (qh[idx / 4] >> ((idx & 3) * 2)) & 3;
-            int v = low | (high << 4);
-            out[base + idx] = ((float)v - 32.0f) * sc_d;
+    for (int n = 0; n < 256; n += 128) {
+        for (int l = 0; l < 32; l++) {
+            int is = l / 16;
+            int q1 = ((ql[l +  0] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+            int q2 = ((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+            int q3 = ((ql[l +  0]  >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+            int q4 = ((ql[l + 32]  >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+            if (base + n + l >= cols) return;
+            out[base + n + l +  0] = d * (float)sc[is + 0] * (float)q1;
+            out[base + n + l + 32] = d * (float)sc[is + 2] * (float)q2;
+            out[base + n + l + 64] = d * (float)sc[is + 4] * (float)q3;
+            out[base + n + l + 96] = d * (float)sc[is + 6] * (float)q4;
         }
+        ql += 64; qh += 32; sc += 8;
     }
 }
 
@@ -432,16 +380,16 @@ static void dequant_row(const void* data, int src_type, float* out, int cols) {
             return;
         }
         case CT_GGUF_TYPE_Q2_K: {
-            /* Q2_K: 256-element super-blocks */
+            /* Q2_K: 256-element super-blocks, 84 bytes each */
             int nblk = (cols + 255) / 256;
             for (int b = 0; b < nblk; b++)
-                dequant_q2_k((const uint8_t*)data + (size_t)b * 80, out, cols, b);
+                dequant_q2_k((const uint8_t*)data + (size_t)b * 84, out, cols, b);
             return;
         }
         case CT_GGUF_TYPE_Q3_K: {
             int nblk = (cols + 255) / 256;
             for (int b = 0; b < nblk; b++)
-                dequant_q3_k((const uint8_t*)data + (size_t)b * 116, out, cols, b);
+                dequant_q3_k((const uint8_t*)data + (size_t)b * 110, out, cols, b);
             return;
         }
         case CT_GGUF_TYPE_Q4_K: {
@@ -453,7 +401,7 @@ static void dequant_row(const void* data, int src_type, float* out, int cols) {
         case CT_GGUF_TYPE_Q5_K: {
             int nblk = (cols + 255) / 256;
             for (int b = 0; b < nblk; b++)
-                dequant_q5_k((const uint8_t*)data + (size_t)b * 160, out, cols, b);
+                dequant_q5_k((const uint8_t*)data + (size_t)b * 176, out, cols, b);
             return;
         }
         case CT_GGUF_TYPE_Q6_K: {
@@ -463,9 +411,10 @@ static void dequant_row(const void* data, int src_type, float* out, int cols) {
             return;
         }
         case CT_GGUF_TYPE_Q8_K: {
-            int nblk = (cols + 127) / 128;
+            /* Q8_K: 256-element super-blocks, 292 bytes each */
+            int nblk = (cols + 255) / 256;
             for (int b = 0; b < nblk; b++)
-                dequant_q8_k((const uint8_t*)data + (size_t)b * 130, out, cols, b);
+                dequant_q8_k((const uint8_t*)data + (size_t)b * 292, out, cols, b);
             return;
         }
         default: {
@@ -556,7 +505,7 @@ static size_t row_size_bytes(int cols, int type) {
         }
         case CT_GGUF_TYPE_Q5_K: {
             int nb = (cols + 255) / 256;
-            return (size_t)nb * 160;
+            return (size_t)nb * 176;  // d(2)+dmin(2)+scales(12)+qh(16)+qs(128)
         }
         case CT_GGUF_TYPE_Q6_K: {
             int nb = (cols + 255) / 256;
@@ -564,15 +513,15 @@ static size_t row_size_bytes(int cols, int type) {
         }
         case CT_GGUF_TYPE_Q3_K: {
             int nb = (cols + 255) / 256;
-            return (size_t)nb * 116;  // d(2)+dmin(2)+hmask(4)+qs(96)+scales(12)
+            return (size_t)nb * 110;  // hmask(32)+qs(64)+scales(12)+d(2)
         }
         case CT_GGUF_TYPE_Q2_K: {
             int nb = (cols + 255) / 256;
-            return (size_t)nb * 80;
+            return (size_t)nb * 84;   // scales(16)+qs(64)+d(2)+dmin(2)
         }
         case CT_GGUF_TYPE_Q8_K: {
-            int nb = (cols + 127) / 128;
-            return (size_t)nb * 130;  // d(2)+qs(128)
+            int nb = (cols + 255) / 256;
+            return (size_t)nb * 292;  // d(4)+qs(256)+bsums(32)
         }
         case CT_GGUF_TYPE_BQ1_0: {
             int ng = (cols + 127) / 128;
@@ -1192,6 +1141,7 @@ int main(int argc, char** argv) {
     bool calibrate = false;
     bool preserve_sensitive = true;
     bool verify = false;
+    int adaptive_quant_layers = 0;
 
     /* Parse args */
     for (int i = 1; i < argc; i++) {
@@ -1207,15 +1157,21 @@ int main(int argc, char** argv) {
             preserve_sensitive = false;
         else if (strcmp(argv[i], "--verify") == 0)
             verify = true;
-        else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+        else if (strcmp(argv[i], "--adaptive-quant") == 0 && i + 1 < argc) {
+            int n = atoi(argv[++i]);
+            if (n < 0) n = 0;
+            if (n > 999) n = 999;
+            adaptive_quant_layers = n;
+        } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             printf("Calm Model Converter v0.2 — Phase 6 (Streaming Requantizer)\n");
-            printf("  --input <file.gguf>     Source GGUF model\n");
-            printf("  --format <bq1_0|tq1_0>  Target format (default: tq1_0)\n");
-            printf("  --output <file.gguf>    Output path\n");
-            printf("  --calibrate             MSE-optimal ternary calibration (slower, better quality)\n");
-            printf("  --no-preserve           Don't preserve embed/output in Q8_0\n");
-            printf("  --verify                Validate output GGUF after conversion\n");
-            printf("  --help                  This help\n");
+            printf("  --input <file.gguf>      Source GGUF model\n");
+            printf("  --format <bq1_0|tq1_0>   Target format (default: tq1_0)\n");
+            printf("  --output <file.gguf>     Output path\n");
+            printf("  --calibrate              MSE-optimal ternary calibration (slower, better quality)\n");
+            printf("  --no-preserve            Don't preserve embed/output in Q8_0\n");
+            printf("  --adaptive-quant <N>     Preserve first N layers in Q8_0 (rest in target format)\n");
+            printf("  --verify                 Validate output GGUF after conversion\n");
+            printf("  --help                   This help\n");
             printf("\n");
             printf("Peak RAM: ~row_buf + quant_buf ≈ few MB (streaming)\n");
             return 0;
@@ -1246,6 +1202,8 @@ int main(int argc, char** argv) {
     printf("  Format: %s\n", format_name);
     if (calibrate) printf("  PTQ calibration: ON (MSE-optimal)\n");
     if (preserve_sensitive) printf("  Preserve embed/output: Q8_0\n");
+    if (adaptive_quant_layers > 0) printf("  Adaptive quant: first %d layers in Q8_0, rest in %s\n",
+                                           adaptive_quant_layers, format_name);
     printf("\n");
 
     /* Open source model (mmap) */
@@ -1305,6 +1263,11 @@ int main(int argc, char** argv) {
             tclass = CT_TENSOR_SKIP;
         else if (is_head_tensor(tname) && preserve_sensitive)
             tclass = CT_TENSOR_HEAD;
+        else if (adaptive_quant_layers > 0) {
+            int layer = get_layer_number(tname);
+            if (layer >= 0 && layer < adaptive_quant_layers)
+                tclass = CT_TENSOR_HEAD;  /* Preserve early layers in Q8_0 */
+        }
 
         if (tclass == CT_TENSOR_SKIP)
             out_types[i] = t->type;

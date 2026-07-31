@@ -7,15 +7,63 @@
  * LLM inference по-человечески: mmap + указатели, без копирования.
  */
 #define _GNU_SOURCE
+#if defined(_MSC_VER)
+/* MSVC deprecates strncpy (C4996); the bounded copy below is intentional */
+#define _CRT_SECURE_NO_WARNINGS
+#endif
 #include "calm_gguf.h"
 #include "calm_quant.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* ── Portable whole-file mapping (POSIX mmap / MSVC heap read) ── */
+#if defined(_MSC_VER)
+static void* ct_file_map(const char* path, size_t* out_size, int* out_fd) {
+    FILE* f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "gguf: cannot open %s\n", path); return NULL; }
+    if (_fseeki64(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
+    __int64 sz = _ftelli64(f);
+    if (sz <= 0) { fclose(f); return NULL; }
+    _fseeki64(f, 0, SEEK_SET);
+    void* p = malloc((size_t)sz);
+    if (!p) { fclose(f); return NULL; }
+    if (fread(p, 1, (size_t)sz, f) != (size_t)sz) { free(p); fclose(f); return NULL; }
+    fclose(f);
+    *out_size = (size_t)sz;
+    *out_fd = -1;
+    return p;
+}
+static void ct_file_unmap(void* p, size_t sz, int fd) {
+    (void)sz; (void)fd;
+    free(p);
+}
+#else
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+static void* ct_file_map(const char* path, size_t* out_size, int* out_fd) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) { fprintf(stderr, "gguf: cannot open %s\n", path); return NULL; }
+    struct stat st;
+    if (fstat(fd, &st) != 0) { close(fd); return NULL; }
+    size_t file_size = (size_t)st.st_size;
+    void* base = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (base == MAP_FAILED) {
+        close(fd);
+        fprintf(stderr, "gguf: mmap failed for %s\n", path);
+        return NULL;
+    }
+    *out_size = file_size;
+    *out_fd = fd;
+    return base;
+}
+static void ct_file_unmap(void* p, size_t sz, int fd) {
+    munmap(p, sz);
+    if (fd >= 0) close(fd);
+}
+#endif
 
 /* ═══════════════════════════════════════════════════════════════
  * Helper: read a GGUF key-length (uint32 with uint64 detection)
@@ -46,32 +94,15 @@ static uint64_t read_key_len(const uint8_t* data, size_t offset, size_t size,
 ct_gguf_context* ct_gguf_open(const char* path) {
     if (!path) return NULL;
 
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) {
-        fprintf(stderr, "gguf: cannot open %s\n", path);
-        return NULL;
-    }
-
-    struct stat st;
-    if (fstat(fd, &st) != 0) {
-        close(fd);
-        return NULL;
-    }
-    size_t file_size = (size_t)st.st_size;
-
-    /* mmap the whole file */
-    void* base = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    if (base == MAP_FAILED) {
-        close(fd);
-        fprintf(stderr, "gguf: mmap failed for %s\n", path);
-        return NULL;
-    }
+    size_t file_size = 0;
+    int fd = -1;
+    void* base = ct_file_map(path, &file_size, &fd);
+    if (!base) return NULL;
 
     uint8_t* data = (uint8_t*)base;
     ct_gguf_context* ctx = calloc(1, sizeof(ct_gguf_context));
     if (!ctx) {
-        munmap(base, file_size);
-        close(fd);
+        ct_file_unmap(base, file_size, fd);
         return NULL;
     }
     ctx->data = (char*)data;
@@ -440,9 +471,10 @@ const char* ct_gguf_architecture(const ct_gguf_context* ctx) {
 void ct_gguf_close(ct_gguf_context* ctx) {
     if (!ctx) return;
     if (ctx->data && ctx->size > 0)
-        munmap(ctx->data, ctx->size);
-    if (ctx->fd >= 0)
-        close(ctx->fd);
+        ct_file_unmap(ctx->data, ctx->size, ctx->fd);
+    ctx->data = NULL;
+    ctx->size = 0;
+    ctx->fd = -1;
 
     /* Free metadata strings */
     for (int i = 0; i < ctx->metadata.count; i++) {
@@ -524,21 +556,29 @@ size_t ct_gguf_tensor_size(int type, int n_dims, const uint64_t* dims) {
             int nb = (int)((cols + 31) / 32);
             return (size_t)rows * nb * 22;  /* uint16 d + uint8 qh[4] + uint8 qs[16] = 22 */
         }
+        case CT_GGUF_TYPE_Q2_K: {
+            int nb = (int)((cols + 255) / 256);
+            return (size_t)rows * nb * 84;  /* scales[16] + qs[64] + d(F16) + dmin(F16) = 84 */
+        }
+        case CT_GGUF_TYPE_Q3_K: {
+            int nb = (int)((cols + 255) / 256);
+            return (size_t)rows * nb * 110; /* hmask[32] + qs[64] + scales[12] + d(F16) = 110 */
+        }
         case CT_GGUF_TYPE_Q4_K: {
             int nb = (int)((cols + 255) / 256);
             return (size_t)rows * nb * 144; /* uint16 d + uint16 dmin + uint8[12] + uint8[128] = 144 */
         }
         case CT_GGUF_TYPE_Q5_K: {
             int nb = (int)((cols + 255) / 256);
-            return (size_t)rows * nb * 178; /* Q5_K: 178 bytes/256-quant block */
+            return (size_t)rows * nb * 176; /* d+dmin(4) + scales[12] + qh[32] + qs[128] = 176 */
         }
         case CT_GGUF_TYPE_Q6_K: {
             int nb = (int)((cols + 255) / 256);
             return (size_t)rows * nb * 210; /* uint16 d + uint8 ql[128] + uint8 qh[64] + int8[16] = 210 */
         }
         case CT_GGUF_TYPE_Q8_K: {
-            int nb = (int)((cols + 127) / 128);
-            return (size_t)rows * nb * 130; /* uint16 d + uint8 qs[128] = 130, 128 elem/block */
+            int nb = (int)((cols + 255) / 256);
+            return (size_t)rows * nb * 292; /* float d(4) + qs[256] + bsums[16](32) = 292, 256 elem/block */
         }
         /* Our custom formats */
         case CT_GGUF_TYPE_BQ1_0: {
@@ -548,6 +588,10 @@ size_t ct_gguf_tensor_size(int type, int n_dims, const uint64_t* dims) {
         case CT_GGUF_TYPE_TQ1_0: {
             int nb = (int)((cols + 255) / 256);
             return (size_t)rows * nb * CT_SIZEOF_TQ1_0;
+        }
+        case CT_GGUF_TYPE_IQ4_NL_STD: {
+            int nb = (int)((cols + 31) / 32);
+            return (size_t)rows * nb * 18;  /* uint16 d + uint8 qs[16] = 18 bytes per 32-element block */
         }
         default:
             /* Unknown: estimate 2 bytes per element */
@@ -583,6 +627,7 @@ const char* ct_gguf_type_name(int type) {
         case CT_GGUF_TYPE_IQ4_XS: return "IQ4_XS";
         case CT_GGUF_TYPE_BQ1_0: return "BQ1_0";
         case CT_GGUF_TYPE_TQ1_0: return "TQ1_0";
+        case CT_GGUF_TYPE_IQ4_NL_STD: return "IQ4_NL";
         default: return "UNKNOWN";
     }
 }

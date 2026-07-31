@@ -180,6 +180,212 @@ float ct_calibrate_ternary(const float* x, int n, float* out_mse) {
     return best_alpha;
 }
 
+/* ═══════════════════════════════════════════════════════════════
+ * TQ1_0 → Q8_0 dequant (platform-independent, used by both NEON and AVX2)
+ *
+ * TQ1_0 block (256 elements): base-3 packed {−1,0,+1} × d
+ * Q8_0 block (32 elements):   int8 × d
+ *
+ * Decode TQ1_0 block into 8 × Q8_0 blocks (256 elements → 8×32).
+ * out_q8 must point to at least 8 × CT_SIZEOF_Q8_0 bytes.
+ * Returns the number of valid elements (256 or less for partial block).
+ * ═══════════════════════════════════════════════════════════════ */
+
+static int dequant_tq1_0_to_q8_0(const ct_block_tq1_0* tq,
+                                    ct_block_q8_0* out_q8, int cols) {
+    int n = cols < 256 ? cols : 256;
+    int idx = 0;
+
+    /* Decode all 256 ternary values into a temporary int8 array */
+    int8_t tmp[256];
+    memset(tmp, 0, sizeof(tmp));
+
+    /* First 240 values from qs (48 bytes × 5 per byte, base-3) */
+    for (int i = 0; i < 48 && idx < 256; i++) {
+        int byte_val = tq->qs[i];
+        for (int j = 0; j < 5 && idx < 256; j++) {
+            int t = (byte_val % 3) - 1;  /* 0→-1, 1→0, 2→+1 */
+            byte_val /= 3;
+            tmp[idx++] = (int8_t)t;
+        }
+    }
+    /* Last 16 values from qh (4 bytes × 4 per byte, 2-bit) */
+    for (int i = 0; i < 4 && idx < 256; i++) {
+        uint8_t byte_val = tq->qh[i];
+        for (int j = 0; j < 4 && idx < 256; j++) {
+            int v = (byte_val >> (j * 2)) & 3;
+            tmp[idx++] = (int8_t)(v - 1);  /* 0→-1, 1→0, 2→+1, 3→+2(clamp) */
+        }
+    }
+
+    /* Pack into Q8_0 blocks (32 elements each) */
+    int nb = (n + 31) / 32;
+    for (int b = 0; b < nb; b++) {
+        out_q8[b].d = tq->d;  /* same scale as TQ1_0 */
+        int base = b * 32;
+        for (int i = 0; i < 32; i++) {
+            int idx_q = base + i;
+            out_q8[b].qs[i] = (idx_q < n) ? tmp[idx_q] : 0;
+        }
+    }
+    return n;
+}
+
+/* Platform-independent TQ1_0 base-3 unpack (used by NEON, scalar, and AVX2) */
+static const int tq1_pow3[5] = {1, 3, 9, 27, 81};
+static inline void tq1_unpack_byte(uint8_t byte, int vals[5]) {
+    int tmp = byte;
+    for (int i = 0; i < 5; i++) {
+        vals[i] = (tmp % 3) - 1;  /* 0→-1, 1→0, 2→+1 */
+        tmp /= 3;
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * Platform-independent Quantization (used by NEON, scalar, and AVX2)
+ * ═══════════════════════════════════════════════════════════════ */
+
+void ct_quant_q8_0(const float* x, ct_block_q8_0* block, int count) {
+    int n = count < 32 ? count : 32;
+    float amax = 0.0f;
+    for (int i = 0; i < n; i++) {
+        float a = fabsf(x[i]);
+        if (a > amax) amax = a;
+    }
+    if (amax == 0) {
+        block->d = ct_fp32_to_fp16(1.0f);
+        memset(block->qs, 0, n);
+        return;
+    }
+    float d = amax / 127.0f;
+    float id = 127.0f / amax;
+    block->d = ct_fp32_to_fp16(d);
+    for (int i = 0; i < n; i++)
+        block->qs[i] = (int8_t)(x[i] * id);
+    for (int i = n; i < count; i++)
+        block->qs[i] = 0;
+}
+
+void ct_quant_bq1_0(const float* x, ct_block_bq1_0* block, int count) {
+    float amax = 0.0f;
+    int n = count < 128 ? count : 128;
+    for (int i = 0; i < n; i++) {
+        float a = fabsf(x[i]);
+        if (a > amax) amax = a;
+    }
+    if (amax == 0) {
+        block->d = ct_fp32_to_fp16(1.0f);
+        memset(block->bits, 0, sizeof(block->bits));
+        return;
+    }
+    block->d = ct_fp32_to_fp16(amax);
+    memset(block->bits, 0, sizeof(block->bits));
+    for (int i = 0; i < n; i++) {
+        if (x[i] > 0) {
+            int byte_idx = i >> 6;
+            int bit_idx = i & 0x3F;
+            block->bits[byte_idx] |= (uint64_t)1 << bit_idx;
+        }
+    }
+    for (int i = n; i < count; i++) {
+        int byte_idx = i >> 6;
+        int bit_idx = i & 0x3F;
+        block->bits[byte_idx] &= ~((uint64_t)1 << bit_idx);
+    }
+}
+
+void ct_quant_tq1_0(const float* x, ct_block_tq1_0* block, int count) {
+    int n = count < 256 ? count : 256;
+    float amax = 0.0f;
+    for (int i = 0; i < n; i++) {
+        float a = fabsf(x[i]);
+        if (a > amax) amax = a;
+    }
+    if (amax == 0) {
+        block->d = ct_fp32_to_fp16(1.0f);
+        memset(block->qs, 0, sizeof(block->qs));
+        memset(block->qh, 0, sizeof(block->qh));
+        return;
+    }
+    block->d = ct_fp32_to_fp16(amax);
+    float id = 1.0f / amax;
+    memset(block->qs, 0, sizeof(block->qs));
+    memset(block->qh, 0, sizeof(block->qh));
+    int idx = 0;
+    for (int i = 0; i < 48 && idx < n; i++) {
+        int byte_val = 0;
+        int mult = 1;
+        for (int j = 0; j < 5 && idx < n; j++) {
+            float v = x[idx] * id;
+            int t;
+            if (v > 0.5f) t = 2;
+            else if (v < -0.5f) t = 0;
+            else t = 1;
+            byte_val += t * mult;
+            mult *= 3;
+            idx++;
+        }
+        block->qs[i] = (uint8_t)byte_val;
+    }
+    for (int i = 0; i < 4 && idx < n; i++) {
+        uint8_t byte_val = 0;
+        for (int j = 0; j < 4 && idx < n; j++) {
+            float v = x[idx] * id;
+            int t;
+            if (v > 0.5f) t = 2;
+            else if (v < -0.5f) t = 0;
+            else t = 1;
+            byte_val |= (uint8_t)t << (j * 2);
+            idx++;
+        }
+        block->qh[i] = byte_val;
+    }
+}
+
+void ct_quant_tq1_0_fast(const float* x, ct_block_tq1_0* block, int count) {
+    int n = count < 256 ? count : 256;
+    float sum_abs = 0.0f;
+    for (int i = 0; i < n; i++)
+        sum_abs += fabsf(x[i]);
+    float d = sum_abs / (float)n;
+    if (d < 1e-10f) d = 1.0f;
+    float id = 1.0f / d;
+
+    memset(block->qs, 0, sizeof(block->qs));
+    memset(block->qh, 0, sizeof(block->qh));
+    block->d = ct_fp32_to_fp16(d);
+
+    int idx = 0;
+    for (int i = 0; i < 48 && idx < n; i++) {
+        int byte_val = 0;
+        int mult = 1;
+        for (int j = 0; j < 5 && idx < n; j++) {
+            float v = x[idx] * id;
+            int t;
+            if (v > 0.5f) t = 2;
+            else if (v < -0.5f) t = 0;
+            else t = 1;
+            byte_val += t * mult;
+            mult *= 3;
+            idx++;
+        }
+        block->qs[i] = (uint8_t)byte_val;
+    }
+    for (int i = 0; i < 4 && idx < n; i++) {
+        uint8_t byte_val = 0;
+        for (int j = 0; j < 4 && idx < n; j++) {
+            float v = x[idx] * id;
+            int t;
+            if (v > 0.5f) t = 2;
+            else if (v < -0.5f) t = 0;
+            else t = 1;
+            byte_val |= (uint8_t)t << (j * 2);
+            idx++;
+        }
+        block->qh[i] = byte_val;
+    }
+}
+
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
 
@@ -200,7 +406,8 @@ void ct_dequant_q4_0(const ct_block_q4_0* block, float* out, int count) {
     float d = fp16_to_f32(block->d);
     int n = count < 32 ? count : 32;
     for (int i = 0; i < n; i++) {
-        int nib = (block->qs[i >> 1] >> ((i & 1) << 2)) & 0xF;
+        /* strided: qs[j] = [v_j | v_{j+16} << 4] */
+        int nib = (block->qs[i & 15] >> ((i >> 4) << 2)) & 0xF;
         out[i] = ((float)nib - 8.0f) * d;
     }
     for (int i = n; i < count; i++)
@@ -217,17 +424,6 @@ void ct_dequant_bq1_0(const ct_block_bq1_0* block, float* out, int count) {
     }
     for (int i = n; i < count; i++)
         out[i] = 0;
-}
-
-/* TQ1_0 dequant: base-3 unpacking */
-/* 5 ternary values per byte (3^5 = 243 < 256) */
-static const int tq1_pow3[5] = {1, 3, 9, 27, 81};
-static inline void tq1_unpack_byte(uint8_t byte, int vals[5]) {
-    int tmp = byte;
-    for (int i = 0; i < 5; i++) {
-        vals[i] = (tmp % 3) - 1;  /* 0→-1, 1→0, 2→+1 */
-        tmp /= 3;
-    }
 }
 
 void ct_dequant_tq1_0(const ct_block_tq1_0* block, float* out, int count) {
@@ -253,7 +449,10 @@ void ct_dequant_tq1_0(const ct_block_tq1_0* block, float* out, int count) {
 }
 
 /* ═══════════════════════════════════════════════════════════════
- * NEON: Quantization
+ * NEON: TQ1_0 Matmul via Q8_0 path
+ *
+ * Dequantizes TQ1_0 → Q8_0 blocks on-the-fly, then delegates to
+ * the NEON-optimized ct_matmul_q8_0(). Reuses existing SIMD code.
  * ═══════════════════════════════════════════════════════════════ */
 
 void ct_quant_q8_0(const float* x, ct_block_q8_0* block, int count) {
@@ -421,36 +620,41 @@ void ct_quant_tq1_0_fast(const float* x, ct_block_tq1_0* block, int count) {
 }
 
 /* ═══════════════════════════════════════════════════════════════
- * TQ1_0 → Q8_0 dequant for NEON matmul reuse
+ * NEON: TQ1_0 Matmul via Q8_0 path
  *
- * TQ1_0 block (256 elements): base-3 packed {−1,0,+1} × d
- * Q8_0 block (32 elements):   int8 × d
- *
- * Ternary values fit directly into int8, so we decode TQ1_0 →
- * int8 packs and set Q8_0 scale = TQ1_0 scale. No float needed.
+ * Dequantizes TQ1_0 → Q8_0 blocks on-the-fly, then delegates to
+ * the NEON-optimized ct_matmul_q8_0(). Reuses existing SIMD code.
  * ═══════════════════════════════════════════════════════════════ */
 
-/* Decode TQ1_0 block into 8 × Q8_0 blocks (256 elements → 8×32).
- * out_q8 must point to at least 8 × CT_SIZEOF_Q8_0 bytes.
- * Returns the number of valid elements (256 or less for partial block).
- */
-static int dequant_tq1_0_to_q8_0(const ct_block_tq1_0* tq,
-                                   ct_block_q8_0* out_q8, int cols) {
-    int n = cols < 256 ? cols : 256;
-    int idx = 0;
+void ct_matmul_tq1_0(float* y, const float* x,
+                       const ct_block_tq1_0* W, int I, int O) {
+    int nb_per_row_tq = (I + 255) / 256;
 
-    /* Decode all 256 ternary values into a temporary int8 array */
-    int8_t tmp[256];
-    memset(tmp, 0, sizeof(tmp));
+    /* Temporary Q8_0 buffer for one row */
+    int max_q8_blocks = (I + 31) / 32;
+    ct_block_q8_0* q8_buf = (ct_block_q8_0*)malloc((size_t)max_q8_blocks * CT_SIZEOF_Q8_0);
+    if (!q8_buf) {
+        memset(y, 0, (size_t)O * sizeof(float));
+        return;
+    }
 
-    /* First 240 values from qs (48 bytes × 5 per byte, base-3) */
-    for (int i = 0; i < 48 && idx < 256; i++) {
-        int byte_val = tq->qs[i];
-        for (int j = 0; j < 5 && idx < 256; j++) {
-            int t = (byte_val % 3) - 1;  /* 0→-1, 1→0, 2→+1 */
-            byte_val /= 3;
-            tmp[idx++] = (int8_t)t;
+    for (int j = 0; j < O; j++) {
+        const ct_block_tq1_0* tq_row = W + (int64_t)j * nb_per_row_tq;
+        int q8_count = 0;
+
+        for (int b = 0; b < nb_per_row_tq; b++) {
+            int remaining = I - b * 256;
+            if (remaining <= 0) break;
+            int cols_in_block = remaining < 256 ? remaining : 256;
+            dequant_tq1_0_to_q8_0(&tq_row[b], &q8_buf[q8_count], cols_in_block);
+            q8_count += (cols_in_block + 31) / 32;
         }
+
+        ct_matmul_q8_0(y + j, x, q8_buf, I, 1);
+    }
+
+    free(q8_buf);
+}
     }
     /* Last 16 values from qh (4 bytes × 4 per byte, 2-bit) */
     for (int i = 0; i < 4 && idx < 256; i++) {
@@ -576,8 +780,9 @@ void ct_matmul_q4_0(float* y, const float* x,
 
             int8_t qs[32];
             for (int k = 0; k < 16; k++) {
-                qs[k * 2]     = (int8_t)((row[b].qs[k] & 0x0F) - 8);
-                qs[k * 2 + 1] = (int8_t)((row[b].qs[k] >> 4) - 8);
+                /* strided: qs[j] = [v_j | v_{j+16} << 4] */
+                qs[k]      = (int8_t)((row[b].qs[k] & 0x0F) - 8);
+                qs[k + 16] = (int8_t)((row[b].qs[k] >> 4) - 8);
             }
 
             for (int g = 0; g < 4; g++) {
@@ -704,7 +909,7 @@ void ct_quant_init(void) {
     ct_fp16_init();
 }
 
-#elif !defined(__AVX2__)  /* scalar fallback (no SIMD at all) */
+#elif !defined(__AVX2__)  /* scalar fallback — used when neither NEON nor AVX2 are available */
 
 /* ── Scalar implementations for non-ARM platforms ── */
 
@@ -727,7 +932,8 @@ void ct_dequant_q4_0(const ct_block_q4_0* block, float* out, int count) {
     float d = fp16_to_f32(block->d);
     int n = count < 32 ? count : 32;
     for (int i = 0; i < n; i++) {
-        int nib = (block->qs[i >> 1] >> ((i & 1) << 2)) & 0xF;
+        /* strided: qs[j] = [v_j | v_{j+16} << 4] */
+        int nib = (block->qs[i & 15] >> ((i >> 4) << 2)) & 0xF;
         out[i] = ((float)nib - 8.0f) * d;
     }
     for (int i = n; i < count; i++) out[i] = 0;
@@ -789,7 +995,8 @@ void ct_matmul_q4_0(float* y, const float* x, const ct_block_q4_0* W, int I, int
             int i0 = b * 32;
             int n = (I - i0 < 32) ? I - i0 : 32;
             for (int k = 0; k < n; k++) {
-                int nib = (row[b].qs[k >> 1] >> ((k & 1) << 2)) & 0xF;
+                /* strided: qs[j] = [v_j | v_{j+16} << 4] */
+                int nib = (row[b].qs[k & 15] >> ((k >> 4) << 2)) & 0xF;
                 sum += x[i0 + k] * ((float)nib - 8.0f) * d;
             }
         }
@@ -970,8 +1177,9 @@ void ct_matmul_q4_0(float* y, const float* x,
             /* Unpack nibbles to int8 (subtract 8 for signedness) */
             int8_t qs[32];
             for (int k = 0; k < 16; k++) {
-                qs[k * 2]     = (int8_t)((row[b].qs[k] & 0x0F) - 8);
-                qs[k * 2 + 1] = (int8_t)((row[b].qs[k] >> 4) - 8);
+                /* strided: qs[j] = [v_j | v_{j+16} << 4] */
+                qs[k]      = (int8_t)((row[b].qs[k] & 0x0F) - 8);
+                qs[k + 16] = (int8_t)((row[b].qs[k] >> 4) - 8);
             }
 
             for (int g = 0; g < 4; g++) {
@@ -1005,67 +1213,102 @@ void ct_matmul_q4_0(float* y, const float* x,
     }
 }
 
-/* ─── AVX2: BQ1_0 Matmul (scalar — bit-by-bit, same as fallback) ─── */
+/* ─── AVX2: BQ1_0 Matmul — binary {−1,+1} × scale via SIMD mask ───
+ *
+ * Trick: y[j] = Σ d·(2·bit−1)·x[i] = d·(2·Σ_masked − Σ_all)
+ * Where Σ_masked = Σ x[i] for bit=1, Σ_all = Σ x[i] for the group.
+ * Process 8 floats/iteration, mask lanes by extracting 8 bits at a time. */
 void ct_matmul_bq1_0(float* y, const float* x,
-                      const ct_block_bq1_0* W, int I, int O) {
+                       const ct_block_bq1_0* W, int I, int O) {
     int ng_per_row = (I + 127) / 128;
+
     for (int j = 0; j < O; j++) {
         const ct_block_bq1_0* row = W + (int64_t)j * ng_per_row;
-        float sum = 0.0f;
+        float total = 0.0f;
+
         for (int g = 0; g < ng_per_row; g++) {
             float d = fp16_to_f32(row[g].d);
             uint64_t bits0 = row[g].bits[0];
             uint64_t bits1 = row[g].bits[1];
             int i0 = g * 128;
             int n = (I - i0 < 128) ? I - i0 : 128;
-            int half_n = (n < 64) ? n : 64;
-            for (int k = 0; k < half_n; k++)
-                sum += x[i0 + k] * ((bits0 >> k) & 1 ? d : -d);
-            for (int k = 0; k < n - 64; k++)
-                sum += x[i0 + 64 + k] * ((bits1 >> k) & 1 ? d : -d);
+
+            __m256 vsum_all = _mm256_setzero_ps();
+            __m256 vsum_masked = _mm256_setzero_ps();
+
+            int k = 0;
+            for (; k + 8 <= n; k += 8) {
+                __m256 xv = _mm256_loadu_ps(x + i0 + k);
+                vsum_all = _mm256_add_ps(vsum_all, xv);
+
+                /* Extract 8 bits from the uint64 word (bit 0..7 = element 0..7) */
+                uint64_t chunk = (k < 64) ? bits0 : bits1;
+                int shift = (k & 0x3F);
+                int byte = (int)((chunk >> shift) & 0xFF);
+
+                /* Build per-lane mask: lane i = -1 if bit i == 1, else 0 */
+                __m256i mask_i = _mm256_set_epi32(
+                    (byte & 0x80) ? -1 : 0,
+                    (byte & 0x40) ? -1 : 0,
+                    (byte & 0x20) ? -1 : 0,
+                    (byte & 0x10) ? -1 : 0,
+                    (byte & 0x08) ? -1 : 0,
+                    (byte & 0x04) ? -1 : 0,
+                    (byte & 0x02) ? -1 : 0,
+                    (byte & 0x01) ? -1 : 0);
+                __m256 masked = _mm256_and_ps(xv, _mm256_castsi256_ps(mask_i));
+                vsum_masked = _mm256_add_ps(vsum_masked, masked);
+            }
+
+            float sum_all = hsum_ps(vsum_all);
+            float sum_masked = hsum_ps(vsum_masked);
+            total += d * (2.0f * sum_masked - sum_all);
+
+            /* Scalar remainder */
+            for (; k < n; k++) {
+                uint64_t bits = (k < 64) ? bits0 : bits1;
+                int bit = (bits >> (k & 0x3F)) & 1;
+                total += x[i0 + k] * (bit ? d : -d);
+            }
         }
-        y[j] = sum;
+        y[j] = total;
     }
 }
 
-/* ─── AVX2: TQ1_0 Matmul (scalar — ternary decode, same as fallback) ─── */
+/* ─── AVX2: TQ1_0 Matmul — dequant-to-Q8_0 path ───
+ *
+ * Dequantizes TQ1_0 → Q8_0 blocks on-the-fly (same as NEON path),
+ * then uses fast AVX2 Q8_0 matmul. 3-5× faster than scalar base-3 unpack. */
 void ct_matmul_tq1_0(float* y, const float* x,
-                      const ct_block_tq1_0* W, int I, int O) {
-    int nb_per_row = (I + 255) / 256;
-    for (int j = 0; j < O; j++) {
-        const ct_block_tq1_0* row = W + (int64_t)j * nb_per_row;
-        float sum = 0.0f;
-        for (int b = 0; b < nb_per_row; b++) {
-            float d = fp16_to_f32(row[b].d);
-            int i0 = b * 256;
-            int idx = 0;
-            int n = (I - i0 < 256) ? I - i0 : 256;
-            for (int j2 = 0; j2 < 48 && idx < n; j2++) {
-                int tmp = row[b].qs[j2];
-                for (int k = 0; k < 5 && idx < n; k++) {
-                    int v = (tmp % 3) - 1;
-                    tmp /= 3;
-                    if (v != 0) sum += x[i0 + idx] * d * (float)v;
-                    idx++;
-                }
-            }
-            for (int j2 = 0; j2 < 4 && idx < n; j2++) {
-                uint8_t byte_val = row[b].qh[j2];
-                for (int k = 0; k < 4 && idx < n; k++) {
-                    int v = (byte_val >> (k * 2)) & 3;
-                    if (v != 1) {
-                        float sv = (v == 2) ? 1.0f : -1.0f;
-                        sum += x[i0 + idx] * d * sv;
-                    }
-                    idx++;
-                }
-            }
-        }
-        y[j] = sum;
+                       const ct_block_tq1_0* W, int I, int O) {
+    int nb_per_row_tq = (I + 255) / 256;
+    int max_q8_blocks = (I + 31) / 32;
+    ct_block_q8_0* q8_buf = (ct_block_q8_0*)malloc((size_t)max_q8_blocks * CT_SIZEOF_Q8_0);
+    if (!q8_buf) {
+        memset(y, 0, (size_t)O * sizeof(float));
+        return;
     }
+
+    for (int j = 0; j < O; j++) {
+        const ct_block_tq1_0* tq_row = W + (int64_t)j * nb_per_row_tq;
+        int q8_count = 0;
+
+        for (int b = 0; b < nb_per_row_tq; b++) {
+            int remaining = I - b * 256;
+            if (remaining <= 0) break;
+            int cols_in_block = remaining < 256 ? remaining : 256;
+            dequant_tq1_0_to_q8_0(&tq_row[b], &q8_buf[q8_count], cols_in_block);
+            q8_count += (cols_in_block + 31) / 32;
+        }
+
+        /* Run AVX2 Q8_0 matmul for this single output row */
+        ct_matmul_q8_0(y + j, x, q8_buf, I, 1);
+    }
+
+    free(q8_buf);
 }
 
-/* ─── AVX2: F32 Matmul (simple, no SIMD needed) ─── */
+/* ─── AVX2: F32 Matmul (8-wide FMA) ─── */
 void ct_matmul_f32(float* y, const float* x, const float* W, int I, int O) {
     for (int o = 0; o < O; o++) {
         const float* wrow = W + (int64_t)o * I;
@@ -1099,6 +1342,65 @@ void ct_matmul_batch_tq1_0(float* y, const float* x, int n_tokens,
                             const ct_block_tq1_0* W, int I, int O) {
     for (int t = 0; t < n_tokens; t++)
         ct_matmul_tq1_0(y + (int64_t)t * O, x + (int64_t)t * I, W, I, O);
+}
+
+/* ─── AVX2: Dequant, Quant, and Init ─── */
+
+static bool ct_fp16_inited = false;
+
+void ct_quant_init(void) {
+    if (!ct_fp16_inited) {
+        ct_fp16_init();
+        ct_fp16_inited = true;
+    }
+}
+
+void ct_dequant_q8_0(const ct_block_q8_0* block, float* out, int count) {
+    float d = fp16_to_f32(block->d);
+    int n = count < 32 ? count : 32;
+    for (int i = 0; i < n; i++) out[i] = block->qs[i] * d;
+    for (int i = n; i < count; i++) out[i] = 0;
+}
+
+void ct_dequant_q4_0(const ct_block_q4_0* block, float* out, int count) {
+    float d = fp16_to_f32(block->d);
+    int n = count < 32 ? count : 32;
+    for (int i = 0; i < n; i++) {
+        /* strided: qs[j] = [v_j | v_{j+16} << 4] */
+        int nib = (block->qs[i & 15] >> ((i >> 4) << 2)) & 0xF;
+        out[i] = ((float)nib - 8.0f) * d;
+    }
+    for (int i = n; i < count; i++) out[i] = 0;
+}
+
+void ct_dequant_bq1_0(const ct_block_bq1_0* block, float* out, int count) {
+    float d = fp16_to_f32(block->d);
+    int n = count < 128 ? count : 128;
+    for (int i = 0; i < n; i++) {
+        int byte_idx = i >> 6;
+        int bit_idx = i & 0x3F;
+        out[i] = ((block->bits[byte_idx] >> bit_idx) & 1) ? d : -d;
+    }
+    for (int i = n; i < count; i++) out[i] = 0;
+}
+
+void ct_dequant_tq1_0(const ct_block_tq1_0* block, float* out, int count) {
+    float d = fp16_to_f32(block->d);
+    int n = count < 256 ? count : 256;
+    int idx = 0;
+    for (int i = 0; i < 48 && idx < n; i++) {
+        int vals[5];
+        tq1_unpack_byte(block->qs[i], vals);
+        for (int j = 0; j < 5 && idx < n; j++)
+            out[idx++] = (float)vals[j] * d;
+    }
+    for (int i = 0; i < 4 && idx < n; i++) {
+        for (int j = 0; j < 4 && idx < n; j++) {
+            int v = (block->qh[i] >> (j * 2)) & 3;
+            out[idx++] = (float)(v - 1) * d;
+        }
+    }
+    for (; idx < count; idx++) out[idx] = 0;
 }
 
 #endif /* __AVX2__ */

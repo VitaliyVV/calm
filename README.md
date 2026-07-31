@@ -2,9 +2,7 @@
 
 **Pure C, no dependencies, runs anywhere.** GGUF → tokenization → inference → tool calling → HTTP API. **Optional Vulkan GPU compute backend** for quantized matmul acceleration on mobile GPUs.
 
-Built for ARM (phone, tablet, Raspberry Pi) and x86. Binary ~176 KB. Runs Qwen2.5 0.5B at ~5–10 tok/s on a Snapdragon 8+ Gen 1 (CPU) or **~8–15 tok/s with Vulkan GPU offload**.
-
-**Supports SSM (Mamba1) hybrid architectures** — Jamba, Qwen3.5, Ornith, Qwythos models with selective scan layers.
+Built for ARM (phone, tablet, Raspberry Pi) and x86. Binary ~113 KB. Runs Qwen2.5 0.5B at ~5–10 tok/s on a Snapdragon 8+ Gen 1 (CPU) or **~8–15 tok/s with Vulkan GPU offload**.
 
 ## Quick Start
 
@@ -27,12 +25,11 @@ make
 ## Features
 
 - **Native inference** — RMS norm, RoPE, SiLU activation, SwiGLU FFN, multi-head attention. No llama.cpp, no Python, no CUDA.
-- **SSM (Mamba1) inference** — Selective scan layers for hybrid Transformer+SSM architectures (Jamba, Qwen3.5, Ornith, Qwythos).
 - **GGUF format** — Loads any LLaMA-family GGUF (Qwen2, LLaMA 2/3, Mistral, Phi-3, CodeLlama). GPT-2 BPE tokenizer with byte-level decoding.
 - **HTTP API** — OpenAI-compatible `/v1/completions`. POSIX socket server, thread-per-request, zero HTTP dependencies.
 - **Function/tool calling** — Qwen2.5 `<|tool_call|>` format. Built-in tools: `get_current_time`, `get_weather`, `search`, `calculator`. Custom tools via JSON config.
-- **Quantized inference** — FP32, F16, Q4_0, Q4_1, Q8_0, BQ1_0 (binary), TQ1_0 (ternary) via NEON SIMD on ARM. K-quant fallback via dequant-to-F32.
-- **Model conversion** — `calm_convert` converts any GGUF (Q8_0, Q4_0, Q4_K, Q5_K, Q6_K, Q3_K, etc.) to BQ1_0 or TQ1_0 via mmap streaming. **No full-tensor buffer** — peak RAM ≈ 1 float row (~2 MB for 9B models). Features: `--calibrate` (MSE-optimal ternary thresholds), `--verify` (post-conversion integrity check), **4-thread parallel processing**.
+- **Quantized inference** — FP32, Q4_0, Q8_0, BQ1_0 (binary), TQ1_0 (ternary) via NEON SIMD on ARM.
+- **Model conversion** — Convert FP32/Q8_0 GGUF to BQ1_0/TQ1_0 format for memory-constrained devices.
 
 ## Supported Architectures
 
@@ -43,37 +40,28 @@ make
 | Mistral | ✅ Native | Compatible |
 | Phi-3 | ✅ Native | Compatible |
 | CodeLlama | ✅ Native | Compatible |
-| **Jamba (SSM + Attention hybrid)** | ✅ **Native SSM** | **Phase 7 — new!** |
-| **Qwen3.5 (SSM hybrid)** | ✅ **Native SSM** | **Phase 7 — new!** |
-| Falcon | ❌ | Not supported |
-| GPT-2 / ChatGLM / Mamba2 | ❌ | Not supported |
+| Falcon / GPT-2 | ❌ | Not supported |
+| ChatGLM / Mamba | ❌ | Not supported |
 
 ## CLI Usage
 
 ```
-calm run      <model.gguf> [prompt]          Smart launch with auto-config
-calm serve    <model.gguf>                  Start HTTP API server
-calm analyze  <model.gguf>                  Display model architecture info
-calm scan                                   Scan device (RAM, CPU, GPU)
-calm estimate <model.gguf>                  Performance prediction
-calm convert  <model.gguf>                  Convert to 1-bit (BQ1_0/TQ1_0)
-calm tokenize <model.gguf> <text>           Tokenize text and show tokens
-calm model    info <model.gguf>             Model analysis
-calm download <url>                         Download model from URL or HF
+calm run      <model.gguf>          Run interactive inference
+calm serve    <model.gguf>          Start HTTP API server
+calm analyze  <model.gguf>          Display model architecture info
+calm tokenize <model.gguf> <text>   Tokenize text and show tokens
 
 Flags for `run`:
-  --backend cpu|vulkan     Force backend (default: auto-detect)
-  --gpu-layers N           Layers to offload to GPU (default: 99 = all)
-  --temp FLOAT             Sampling temperature (default: 0.0)
-  --top-p FLOAT            Nucleus sampling (default: 0.95)
-  --top-k INT              Top-k sampling (default: 40)
-  --repeat-penalty FLOAT   Repeat penalty (default: 1.1)
-  --max-tokens INT         Max tokens to generate (default: 20, max: 512)
-  --tools FILE             Tool definitions JSON (enables function calling)
+  --temp FLOAT         Sampling temperature (default: 0.0)
+  --top-p FLOAT        Nucleus sampling threshold (default: 0.95)
+  --top-k INT          Top-k sampling (default: 40)
+  --repeat-penalty FLOAT  Repeat penalty (default: 1.1)
+  --max-tokens INT     Max tokens to generate (default: 512)
+  --tools FILE         Tool definitions JSON (enables function calling)
 
 Flags for `serve`:
-  --port INT               HTTP port (default: 8080)
-  --tools FILE             Tool definitions JSON
+  --port INT           HTTP port (default: 8080)
+  --tools FILE         Tool definitions JSON
 ```
 
 ## HTTP API
@@ -138,17 +126,13 @@ The model can call functions via `<|tool_call|>` format (Qwen2.5 Instruct), and 
 | File | Purpose |
 |---|---|
 | `calm.c` | CLI, generation loop, orchestration |
-| `calm_infer.c` | Native transformer inference (attention, FFN, RoPE, SSM) |
-| `calm_infer.h` | Struct definitions, API declarations |
+| `calm_infer.c` | Native transformer inference (attention, FFN, RoPE) |
 | `calm_gguf.c` | GGUF format parser |
 | `calm_tokenizer.c` | BPE tokenizer (GPT-2 byte-level) |
-| `calm_quant.c` | Quantized type math (Q4_0, Q8_0, BQ1_0, TQ1_0) — NEON/AVX2 |
-| `calm_quant.h` | Block struct definitions for all quant types |
-| `calm_ssm.c` | SSM (Mamba1) selective scan forward pass |
-| `calm_ssm.h` | SSM layer struct, function declarations |
+| `calm_quant.c` | Quantized type math (Q4_0, Q8_0, BQ1_0, TQ1_0) |
 | `calm_server.c` | HTTP API server (POSIX sockets) |
 | `calm_tools.c` | Function calling engine |
-| `calm_convert.c` | Model format converter (GGUF↔GGUF requantizer) |
+| `calm_convert.c` | Model format converter |
 | `calm.h` | Public API |
 | `calm_vulkan.c` | Vulkan GPU compute backend (Q8_0 matmul offload) |
 | `calm_vulkan.h` | Vulkan backend API |
@@ -232,8 +216,7 @@ Measured on Snapdragon 8+ Gen 1 (ARM Cortex-X2 @ 3.2 GHz), Qwen2.5 0.5B Instruct
 - No `/v1/chat/completions` — only `/v1/completions`
 - Single model in memory (no swapping)
 - Thread-per-request server (not async)
-- Only LLaMA-family + Jamba-style hybrid architectures
-- SSM backend: CPU-only (no GPU SSM kernel yet)
+- Only LLaMA-family architectures
 - Vulkan backend: Adreno-only, Q8_0 only, batch matmul only
 
 ## License

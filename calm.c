@@ -27,6 +27,9 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#if defined(_WIN32)
+#include <intrin.h>
+#endif
 #include <math.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -227,6 +230,25 @@ CalmError calm_device_probe(CalmDevice* device) {
                 device->cpu_cores_physical = cluster_count;
         }
     }
+
+    // Windows CPU feature detection via CPUID (fallback when /proc/cpuinfo unavailable)
+#if defined(_WIN32)
+    {
+        int info[4] = {0};
+        __cpuid(info, 1);
+        bool has_osxsave = (info[2] >> 27) & 1;
+        bool has_avx    = (info[2] >> 28) & 1;
+        if (has_osxsave && has_avx) {
+            int info7[4] = {0};
+            __cpuid(info7, 7);
+            device->has_avx2   = (info7[1] >> 5) & 1;   /* EBX bit 5 = AVX2 */
+            device->has_avx512 = (info7[1] >> 16) & 1;  /* EBX bit 16 = AVX512F */
+            int info7_1[4] = {0};
+            __cpuidex(info7_1, 7, 1);
+            device->has_bf16   = (info7_1[2] >> 5) & 1; /* ECX bit 5 = AVX512-BF16 */
+        }
+    }
+#endif
 
     // CPU freq — ищем макс
     for (int i = 0; i < device->cpu_cores_logical && i < 16; i++) {
@@ -2909,6 +2931,8 @@ int main(int argc, char** argv) {
                 } else if (strcmp(be, "vulkan") == 0) {
                     plan.backend = CALM_BACKEND_VULKAN;
                     plan.gpu_layers = 99;
+                } else if (strcmp(be, "auto") == 0) {
+                    /* Keep CALM_BACKEND_AUTO (0) — calm_plan_create() resolves it */;
                 } else {
                     fprintf(stderr, "Unknown backend '%s', using auto-detected\n", be);
                 }

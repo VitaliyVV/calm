@@ -48,7 +48,7 @@ calm                      # Main binary — CLI + generation loop
 ├──────────────────────────────────────────────────┤
 │           Quantized Tensor Math                   │
 │  matmul_q8_0, matmul_q4_0, matmul_bq1_0,         │
-│  matmul_tq1_0 (NEON SIMD on ARM)                 │
+│  matmul_tq1_0 (SIMD: ARM NEON, x86 AVX2)         │
 ├──────────────────────────────────────────────────┤
 │               GGUF Parser                         │
 │  Tensor loading, metadata, tokenizer vocab,       │

@@ -203,8 +203,6 @@ void ct_ssm_selective_scan(float* y, const float* x,
         {
             /* Find byte offset of A[0][i] = A[0*d_inner + i] */
             /* Then read strided by d_inner elements = d_inner * element_size_in_file */
-            uint64_t dims[2] = {(uint64_t)d_inner, (uint64_t)d_state};
-            size_t tensor_size = ct_gguf_tensor_size(t_A, 2, dims);
 
             /* For each state s: A[s][i] = base + s*inner_element_stride + i*element_size_in_type */
             /* But the actual in-file format is blocks... */

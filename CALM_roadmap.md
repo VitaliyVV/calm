@@ -1,8 +1,8 @@
 # Calm — Universal Local LLM Runtime
 
 **Дорожная карта продукта**
-**Дата:** 19 июля 2026 (обновлено 19 июля 2026)
-**Версия:** v0.4 (SSM forward pass + debug cleanup + matmul audit)
+**Дата:** 28 июля 2026 (обновлено 31 июля 2026)
+**Версия:** v0.4 (C engine + AVX2 x86 + Vulkan + auto-config + Bonsai-format kernels)
 
 ---
 
@@ -57,7 +57,7 @@ Qwythos-9B — **не** стандартный dense transformer, а **Jamba-sty
 |---|-------------|--------|--------|
 | 🔵 1 | **Qwen2/Qwen2.5 dense** | ✅ **Работает** | Парсинг GGUF, dequant fallback (Q5_0/Q6_K), BPE токенизатор, forward pass, генерация |
 | 🟡 2 | **SSM hybrid (Qwen3.5/Jamba)** | ❌ **SSM не реализован** | ~600 строк — selective scan, fused QKV, conv1d, layer dispatch. **Нужен для:** Qwythos-9B, Ornith-9B, Qwen3.5 hybrid |
-| 🟢 3 | **GGUF→GGUF Requantizer** | ✅ **Streaming + parallel + verify** | calm_convert.c: mmap streaming, row-by-row dequant→requant, 4-thread parallel, PTQ calibration, --verify, Q8_0→TQ1_0 (0.5B) tested |
+| 🟢 3 | **GGUF→GGUF Requantizer** | ◐ **Dequant есть, mmap streaming нет** | calm_convert.c умеет dequant Q4_K → BQ1_0/TQ1_0, но загружает всё в RAM. Нужен mmap streaming для моделей >3 GB |
 | 🟣 4 | **Bonsai (Qwen3.6, 1-bit)** | ◐ **Форматы есть, рантайма нет** | BQ1_0/TQ1_0 quant ядра есть, но инференс Qwen3.6 не реализован (зависит от направления 2)
 
 ### Реальность на телефоне
@@ -225,38 +225,30 @@ calm convert --input qwen3.6-27b-fp16 --output ternary-2bit --format tq1_0
 
 ---
 
-## Фаза 6: GGUF→GGUF Requantizer ✅
+## Фаза 6: GGUF→GGUF Requantizer ◐ (streaming done)
 
 **Цель:** Стабильная утилита для пережатия любых существующих GGUF моделей (Q4_K_M, Q5_0, Q8_0, Q6_K, FP16, FP32) в BQ1_0/TQ1_0 формат без перезагрузки с HuggingFace. Прямой путь сжать Qwythos-9B-Q4_K_M (5.6 GB) → TQ1_0 (~1.7 GB) для запуска на телефоне.
 
 ### Компоненты
 - [x] **mmap-based streaming**: row-by-row dequant → requant, пиковая RAM = 1 строка float (~2 MB для 9B). Подтверждено: qwen2.5-0.5b (380 MB, 290 тензоров) сконвертирован без OOM
 - [x] **Sensitive layer preservation** (Q8_0): token_embd.weight, output.weight — сохраняются в Q8_0
-- [x] **Dequant типов**: F32, F16, Q8_0, Q4_0, Q4_1, **Q5_0**, **Q5_1**, **Q2_K**, **Q4_K**, **Q5_K**, **Q6_K**, **Q3_K**, **Q8_K**
-- [ ] **Dequant типов (недостающие)**: IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_XS, IQ3_S, IQ4_NL, IQ4_XS (редко встречаются)
-- [x] **PTQ calibration**: `--calibrate` флаг — MSE-optimal threshold sweep для TQ1_0 (без калибровочного датасета)
-- [x] **Параллельная обработка**: 4 worker thread, pwrite в предвычисленные offset'ы, output идентичен sequential
-- [x] **Верификация**: флаг `--verify` — mmap output GGUF, проверка offset+size каждого тензора ≤ file_size
+- [x] **Dequant типов**: F32, F16, Q8_0, Q4_0, Q4_1, **Q5_0**, **Q5_1**, **Q2_K**, **Q4_K**, **Q5_K**, **Q6_K**
+- [ ] **Dequant типов (недостающие)**: Q3_K (stub), Q8_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_XS, IQ3_S, IQ4_NL, IQ4_XS
+- [ ] **PTQ calibration**: `--calibrate` флаг интеграция (MSE-optimal threshold для TQ1_0)
+- [ ] **Параллельная обработка**: requant нескольких тензоров одновременно (worker threads)
+- [ ] **Верификация**: флаг `--verify` — прочитать output GGUF, проверить целостность
 
 ### Технические детали
 - ✅ **Streaming loop реализован**: 2 прохода — Pass 1 вычисляет размеры, Pass 2 stream-конвертит
-- ✅ **Параллельный Pass 2**: 4 потока, chunk-based разделение тензоров, pwrite в выходной fd
-- ✅ **Проверено на qwen2.5-0.5b** — чистый Q8_0 скачан с HuggingFace (676 MB), сконвертирован в TQ1_0 (376 MB) и BQ1_0 (343 MB), verify пройден
-- ✅ **Выходной GGUF загружается calm-движком**: `calm analyze` читает, tensor types корректны
-- ✅ **Q3_K dequant — полностью реализован** (не заглушка): 2 группы K3 с весом по 6 бит, суперблок 16 весов
-- ✅ **Q8_K dequant — полностью реализован**: 8-bit блоки с min/max scaling
+- ✅ **Проверено на qwen2.5-0.5b** (Q5_0+Q6_K → TQ1_0, 380 MB → 230 MB)
+- ✅ **Выходной GGUF загружается calm-движком**: tensor types правильно распознаны (type=65 = TQ1_0)
+- ⚠️ Q3_K dequant — заглушка (zeroes out, но не крешит)
 - ⚠️ IQ форматы не реализованы (редко встречаются в GGUF)
 
 ### Время выполнения
-- ✅ **Streaming core:** ~4 часа (реализовано)
-- ✅ **Dequant типов:** ~3 часа (все основные типы, включая Q3_K, Q8_K)
-- ✅ **PTQ + parallel + verify:** ~4 часа (реализовано, протестировано на реальной модели)
-
-### Добавлено в Phase 6
-- `--verify` флаг: проверяет целостность output GGUF после конвертации
-- Параллельная конвертация: 4 worker thread (ARM big.LITTLE), chunk-based
-- Загрузка чистой модели Q8_0 (676 MB) с HuggingFace для тестирования
-- Bounds check в `stream_tensor()`: детекция обрезанных входных GGUF файлов
+- ◐ **Streaming core:** ~4 часа (реализовано)
+- ◐ **Dequant типов:** ~2 часа (основные сделаны, IQ форматы остались)
+- 🔜 **PTQ + parallel:** ~1-2 дня
 
 ---
 
@@ -265,21 +257,21 @@ calm convert --input qwen3.6-27b-fp16 --output ternary-2bit --format tq1_0
 **Цель:** Добавить Mamba-style Selective Scan (SSM) для поддержки гибридных архитектур. Это откроет: Qwythos-9B (24 SSM + 8 attention слоёв), Qwen3.5-9B, Qwen3.6-27B (Bonsai), Ornith-9B.
 
 ### Компоненты
-- [x] **SSM selective scan ядро** (Mamba-style, O(L) time):
+- [ ] **SSM selective scan ядро** (Mamba-style, O(L) time):
   - Depthwise 1D convolution с SiLU активацией (conv1d)
   - Discretization: Δ → Ā, B̄
   - Scan loop: h[t] = Ā·h[t-1] + B̄·x[t] (все FP32)
   - Обработка 24 SSM слоёв за проход
-- [x] **Fused QKV поддержка для SSM слоёв**:
+- [ ] **Fused QKV поддержка для SSM слоёв**:
   - `attn_qkv.weight` → split на Q, K, V
   - SSM-специфичные веса: `sm_conv1d`, `sm_alpha`, `sm_beta`, `sm_out`, `sm_a`, `sm_dt`
-- [x] **Layer-type dispatch из GGUF metadata**:
+- [ ] **Layer-type dispatch из GGUF metadata**:
   - Qwythos: слои 3,7,11,15,19,23,27,31 → attention; остальные 24 → SSM
   - Определять по наличию `ssm_conv1d` vs `attn_q.weight` в GGUF
   - Generic: читать из metadata ключ типа `qwen35.layer_type.{i}`
-- [x] **QK-RoPE norms** для SSM attention слоёв
-- [x] **Поддержка в `build_weights()`**: загрузка SSM тензоров по именам
-- [x] **Поддержка в `ct_infer_forward()`**: per-layer выбор attention vs SSM
+- [ ] **QK-RoPE norms** для SSM attention слоёв
+- [ ] **Поддержка в `build_weights()`**: загрузка SSM тензоров по именам
+- [ ] **Поддержка в `ct_infer_forward()`**: per-layer выбор attention vs SSM
 
 ### Архитектура Qwythos-9B (32 слоя, Jamba-style)
 ```
@@ -320,13 +312,14 @@ MLA:                k_latent = x·Wuk (d×d_c),  k = k_latent·Wok (d_c×d_h)
 **Преимущество для Calm:** MLA радикально уменьшает KV cache — при d_c = 0.25×d_h, KV cache в 4 раза меньше. Для телефона с 3.4 GB это критично: можно держать больший контекст.
 
 ### Компоненты
-- [ ] **MLA forward**: latent projection K, V → compressed KV → RoPE (decoupled) → attention score
-- [ ] **Decoupled RoPE**: в MLA позиционное внедрение отделено от latent K/V (дополнительный `Wkr` для RoPE)
-- [ ] **DeepSeerMoE dispatch**: fine-grained expert routing (мелкие эксперты, больше экспертов на токен)
-- [ ] **Shared experts**: первые N экспертов фиксированные (общие для всех токенов), не через router
-- [ ] **Weight loading**: `wk_a`, `wk_b`, `wv_a`, `wv_b`, `wr`, `wo` — все MLA-специфичные тензоры
+- [x] **MLA forward**: latent projection K, V → compressed KV → RoPE (decoupled) → attention score (absorption trick)
+- [x] **Decoupled RoPE**: в MLA позиционное внедрение отделено от latent K/V (дополнительный `k_rope` в cache)
+- [x] **Weight loading**: `attn_q_a`, `attn_q_b`, `attn_kv_a`, `attn_kv_b`, `attn_q_norm`, `attn_k_norm` — все MLA-специфичные тензоры
+- [x] **Shared experts**: фиксированные FFN (shared_gate/up/down) на всех токенах, загружаются через `build_weights()`
+- [x] **Integrate with Calm MoE**: shared expert добавлен поверх routed experts в MoE-секции forward pass
+- [ ] **DeepSeerMoE fine-grained routing**: 64 мелких эксперта, top-6 (на базе существующего MoE роутера)
 - [ ] **DeepSeek2 tokenizer**: BPE с специальными токенами (`<｜end▁of▁sentence｜>`, `惜`)
-- [ ] **Integrate with Calm MoE**: Calm MoE уже есть — нужно адаптировать под DeepSeekMoE (shared + routed experts)
+- [ ] **Real DeepSeek2 GGUF model test**: тестирование на DS-Coder-V2-Lite (GGUF ~4 GB)
 
 ### Структура DeepSeek-Coder-V2-Lite (16B, MoE)
 ```
@@ -351,8 +344,26 @@ total params: ~15.7B
 - Calm MoE core: уже есть ✅ — router + expert dispatch
 - KV cache: уже есть ✅ — но MLA требует меньший cache (преимущество)
 
+### Статус: ◐ В разработке (18 июля 2026)
+
+**Реализовано:**
+- `calm_mla.h` / `calm_mla.c` — MLA forward pass с absorption trick (Q_nope @ Wk_b → absorbed_q, weighted latent sum → V)
+- `calm_infer.h` — MLA config поля (kv_lora_rank, q_lora_rank, qk_nope_head_dim, qk_rope_head_dim, v_head_dim, n_shared_expert), MLA weights (attn_q_a/b, attn_kv_a/b, norm), MLA KV cache (mla_kv_cache)
+- `calm_infer.c` — MLA детекция через `attn_kv_a.weight`, weight loading, KV cache alloc, dispatch в forward pass
+- Shared expert (DeepSeekMoE) — weight loading + FFN forward поверх routed MoE
+
+**Осталось:**
+- Тестирование на реальной DeepSeek2 GGUF модели (DS-Coder-V2-Lite-Instruct)
+- Поддержка quantized Wkv_b в MLA absorption loops (сейчас F32 fallback)
+- DeepSeek2 BPE tokenizer (специальные токены)
+- DeepSeerMoE fine-grained (64 experts, top-6) — существующий MoE роутер должен работать
+
+### Новые файлы (~250 строк)
+- `calm_mla.h` — декларация `ct_forward_mla()`
+- `calm_mla.c` — MLA forward pass с absorption trick (Q→absorbed→score, c_weighted→V)
+
 ### Время: 2-3 недели
-### Код: C, ~1000 новых строк (mla_attention.c, deepseek2_moe.c, расширение calm_infer.c/calm_infer.h)
+### Код: C, ~1000 новых строк (mla_attention.c, расширение calm_infer.c/calm_infer.h)
 
 ```
 Фаза 0: Calm CLI (Python)        │ ████████████████  1-2 дня    ✅
@@ -361,16 +372,18 @@ total params: ~15.7B
 Фаза 3: GPU backends             │ ██████░░░░░░░░░░  4-8 нед    ◐ Vulkan + hybrid
 Фаза 4: Auto-config + smart      │ ████████████░░░░  1-2 нед    ✅ core done
 Фаза 5: Production release       │ ░░░░░░░░░░░░░░░░  4-8 нед
-Фаза 6: GGUF↔GGUF Requantizer    │ ████████████████  1-2 нед    ✅ done (streaming + parallel + verify)
-Фаза 7: SSM Forward Pass         │ ░░░░░░░░░░░░░░░░  2-3 нед    🔜
-Фаза 8: DeepSeek2 (MLA+MoE)      │ ░░░░░░░░░░░░░░░░  2-3 нед    🔜
+Фаза 6: GGUF↔GGUF Requantizer    │ ████████░░░░░░░░  1-2 нед    ◐ streaming done
+Фаза 7: SSM Forward Pass         │ ████████████████  2-3 нед    ✅
+Фаза 8: DeepSeek2 (MLA+MoE)      │ █████░░░░░░░░░░░  2-3 нед    ◐ integrated
+Фаза 9: x86/AVX2 Laptop Opt.     │ █████▓░░░░░░░░░░  1 нед      ◐ AVX2 kernels done
                                      └── ~5-10 месяцев всего
 ```
 
 **Ключевые вехи:**
-- ✅ Phase 6 → сжатие любых GGUF в TQ1_0/BQ1_0 через mmap streaming (prerequisite для всего)
-- Phase 7 → **Ornith-9B**, Qwythos-9B, Qwen3.5-9B на телефоне (SSM гибриды)
-- Phase 8 → **DeepSeek-Coder-V2-Lite 16B** на телефоне (MLA + MoE, 2.3 GB BQ1_0)
+- Phase 6 → сжатие любых GGUF в TQ1_0/BQ1_0 через mmap streaming (prerequisite для всего)
+- Phase 7 → **Ornith-9B**, Qwythos-9B, Qwen3.5-9B на телефоне (SSM гибриды) ✅
+- Phase 8 → **DeepSeek-Coder-V2-Lite 16B** на телефоне (MLA + MoE, 2.3 GB BQ1_0) ◐ forward pass integrated
+- Phase 9 → **x86 ноутбук**: AVX2-оптимизированные BQ1_0/TQ1_0 matmul ядра, runtime-детекция CPU features, Makefile x86 target, Windows CPUID, per-layer adaptive quant
 - Phase 7 + 8 → два top-tier кодер-движка на телефоне: Qwen3.5-based и DeepSeek-V2-based
 
 ---
@@ -387,13 +400,12 @@ total params: ~15.7B
 8. ✅ **BPE токенайзер** — работает для GPT-2/tiktoken моделей (Qwen2, Qwen2.5)
 9. ✅ **BQ1_0/TQ1_0 quant ядра** — с NEON оптимизацией
 10. ✅ **GGUF→TQ1_0/BQ1_0 конвертер** — `calm_convert.c`
-11. ✅ **Phase 6: GGUF→GGUF Requantizer** — streaming ✅, dequant F32/F16/Q8_0/Q4_0/Q4_1/Q5_0/Q5_1/Q2_K/Q4_K/Q5_K/Q6_K/Q3_K/Q8_K ✅, PTQ calibration ✅, parallel 4-thread ✅, --verify ✅, IQ форматы остались (редкие)
+11. ◐ **Phase 6: GGUF→GGUF Requantizer** — streaming core ✅, dequant F32/F16/Q8_0/Q4_0/Q4_1/Q5_0/Q5_1/Q2_K/Q4_K/Q5_K/Q6_K ✅, остались IQ форматы
 12. ✅ **Phase 7: SSM Forward Pass** — Mamba-style selective scan для Qwen3.5/Jamba/Ornith гибридов
-13. ✅ **Debug cleanup** — удалены все `[DBG]` fprintf из `calm_infer.c` (5 блоков, ~170 строк)
-14. ✅ **Matmul layout audit** — все 18 matmul вариантов проверены на правильность `[O,I]` GGUF layout'а
-15. 🔄 **Phase 8: DeepSeek2 (MLA+MoE)** — Multi-head Latent Attention + DeepSeekMoE для DeepSeek-Coder-V2
-16. 📦 **mmap/expert streaming** — Colibri-style, холодные эксперты с диска
-17. 📦 **Qwen3.6 архитектура** — для запуска Bonsai-27B (1-bit, 3.9 GB) — зависит от Phase 7
+13. ◐ **Phase 8: DeepSeek2 (MLA+MoE)** — Multi-head Latent Attention + DeepSeekMoE (forward pass integrated: calm_mla.c, calm_infer.h/c, shared expert, absorption trick)
+14. ◐ **Phase 9: x86/AVX2** — AVX2 matmul Q8_0/Q4_0/BQ1_0/TQ1_0 ✅, dequant/quant ✅, Makefile x86 ◐, CPUID Windows 🔲
+15. 📦 **mmap/expert streaming** — Colibri-style, холодные эксперты с диска
+16. 📦 **Qwen3.6 архитектура** — для запуска Bonsai-27B (1-bit, 3.9 GB) — зависит от Phase 7
 
 ---
 
@@ -422,7 +434,9 @@ Phase 6 (Requantizer) ───→ Phase 7 (SSM) ───→ Phase 8 (MLA/DeepS
        │                        ├─ Qwythos-9B ✅
        │                        └─ Qwen3.5-9B ✅
        │
-       └─ Сжать любую модель в TQ1_0/BQ1_0 (prerequisite)
+       ├─ Сжать любую модель в TQ1_0/BQ1_0 (prerequisite)
+       │
+       └──→ Phase 9 (x86/AVX2) — независим, можно параллельно с Phase 7/8
 ```
 
 **Правило:** Ни одна новая архитектура не запустится на телефоне без **Phase 6** — существующие GGUF (Q4_K_M и т.д.) не влезают в 3.4 GB. Requantizer — критический шлюз.
@@ -615,6 +629,128 @@ Transformer+SSM архитектур (Jamba, Ornith, Qwythos, Qwen3.5 SSM).
 - Поддержка Mamba2 (SSM с группировкой)
 - Опциональный GPU/Vulkan SSM kernel
 
+---
+ 
+## 🚀 Phase 9: x86/AVX2 Laptop Optimization (28 июля 2026)
+ 
+**Цель:** Запуск Calm на x86 ноутбуке без дискретного GPU (только CPU, AVX2) с полным
+ускорением экстремальной квантизации (BQ1_0/TQ1_0) через SIMD. 8-12 tok/s для 7B Q8_0,
+20+ tok/s для 7B BQ1_0 на современном x86 CPU (Zen 3 / Alder Lake+).
+ 
+### Исходные данные (x86 ноутбук)
+- CPU: x86_64 с AVX2 + FMA (любой Intel Haswell+ / AMD Excavator+)
+- RAM: 16-32 GB, из них ~8-16 GB доступно под модель
+- GPU: отсутствует или Intel UHD (не используется для LLM)
+- ОС: Linux (WSL2) или Windows (MSVC/MinGW)
+- Хранилище: NVMe SSD (достаточно быстро для mmap)
+
+### Стратегия на ноутбуке
+ 
+```
+Модель               Формат    Вес    Влезает в 16 GB?
+──────               ──────    ───    ─────────────────
+Bonsai-27B           BQ1_0     3.9 GB ✅ (с запасом)
+Bonsai-27B           TQ1_0     5.9 GB ✅
+Qwythos-9B           BQ1_0     1.3 GB ✅
+DS-R1-14B            BQ1_0     2.0 GB ✅
+Qwen3-32B            BQ1_0     4.5 GB ✅
+DeepSeek-V3-671B     BQ1_0    94 GB  ❌ (не влезет)
+```
+ 
+**Ключевой вывод:** На ноутбуке доступно 8-16 GB — это открывает модели до 32B в BQ1_0
+(4.5 GB) с контекстом 32K+ токенов. AVX2 даёт factor 3-5× над скалярным кодом.
+ 
+### Компоненты
+ 
+#### 1. AVX2-оптимизированные matmul ядра ✅ (calm_quant.c)
+ 
+| Ядро | Формат | Алгоритм | Ускорение |
+|------|--------|----------|-----------|
+| `ct_matmul_q8_0` | Q8_0 (8-bit) | vpmovsxbd → FMA с broadcast scale | ~4× над scalar |
+| `ct_matmul_q4_0` | Q4_0 (4-bit) | nibble unpack → sign-extend → FMA | ~3× над scalar |
+| `ct_matmul_bq1_0` | BQ1_0 (1-bit) | per-lane mask (`_mm256_and_ps`) + d·(2·Σ_masked−Σ_all) trick | ~5× над scalar |
+| `ct_matmul_tq1_0` | TQ1_0 (ternary) | dequant→Q8_0 buffer → AVX2 Q8_0 matmul | ~3× над scalar base-3 |
+ 
+**`ct_matmul_bq1_0` (BQ1_0 AVX2):**
+- Обрабатывает 8 float/iteration
+- Для каждой группы: Σ_all (сумма всех x[i]) + mask bits → Σ_masked (сумма x[i] с bit=1)
+  → result = d · (2·Σ_masked − Σ_all)
+- Маска строится через `_mm256_set_epi32` из 8 бит uint64
+- Scalar remainder для хвоста (<8 элементов)
+- Идентичный NEON-пути по логике, но использует `_mm256_and_ps` вместо `vbslq_f32`
+ 
+**`ct_matmul_tq1_0` (TQ1_0 AVX2):**
+- Dequant TQ1_0 block → Q8_0 buffer через `dequant_tq1_0_to_q8_0()` (платформо-независимая)
+- Переиспользует AVX2 Q8_0 matmul (с FMA) для вычислений
+- Меньше кода, проще поддерживать, ~3× быстрее полного scalar base-3 unpack
+ 
+#### 2. Восстановлена AVX2-секция в calm_quant.c ✅
+ 
+До фикса: `#ifdef __AVX2__` секция содержала только `ct_matmul_q8_0` и `ct_matmul_q4_0`,
+но **не имела** `ct_quant_init()`, `ct_dequant_q8_0()`, `ct_dequant_q4_0()`,
+`ct_dequant_bq1_0()`, `ct_dequant_tq1_0()`. При сборке с `-DCT_AVX2`:
+- `ct_quant_init()` → undefined reference (вызывается из `calm.c`)
+- `ct_dequant_q8_0()` → undefined reference (вызывается из `calm_convert.c`)
+- Linker error → сборка падала
+ 
+**Фикс:** Копии всех dequant/quant/init функций добавлены в AVX2-секцию.
+Правильная структура блоков:
+```c
+#if __ARM_NEON
+  /* NEON implementations */
+#elif !defined(__AVX2__)
+  /* Scalar fallback */
+#endif
+ 
+#ifdef __AVX2__
+  /* AVX2 implementations (always compiled when AVX2 available) */
+#endif
+```
+ 
+#### 3. Runtime CPU feature detection ◐ (calm.c)
+ 
+- **Linux:** `/proc/cpuinfo` flags line — AVX2, AVX-512, BF16 уже парсятся ✅
+- **Windows:** CPUID via `__cpuid()` — `has_avx2`, `has_avx512`, `has_bf16` — **не реализован**
+- CalmDevice уже содержит поля: `has_avx2`, `has_avx512`, `has_bf16` ✅
+ 
+#### 4. Makefile x86 target ◐
+ 
+- Цель `make x86` существует (`CFLAGS_X86 = -O2 -std=c11 -mavx2 -mfma -DCT_AVX2`) ✅
+- Проблема: `.c.o` правило добавляет `-DCT_VULKAN` unconditionally — не критично, но грязно
+- Нужно: отдельный `make x86` без Vulkan, с явной `-mavx2 -mfma -DCT_AVX2`
+- Нужно: `make x86-vk` для сборки с Vulkan + AVX2 (если есть Vulkan-совместимый GPU)
+ 
+#### 5. Per-layer adaptive quantization (calm_convert.c) 🔲
+ 
+- `--adaptive-quant N`: первые N слоёв сохранять в Q8_0, остальные в TQ1_0/BQ1_0
+- Позволяет сохранить качество на критических первых/последних слоях
+- Практическая разница: +0.5-1% accuracy, +2-5% размера
+ 
+### Изменённые файлы (Phase 9)
+- `calm_quant.c` — AVX2 matmul ядра для Q8_0, Q4_0, BQ1_0, TQ1_0; dequant/quant/init функции; восстановлена AVX2-секция
+- `calm.h` — флаги CPU feature в CalmDevice ✅ (были добавлены ранее)
+- `calm.c` — `calm_device_probe()` CPUID на Windows + `/proc/cpuinfo` на Linux
+- `calm_infer.c` — dispatch matmul по `has_avx2` в рантайме
+- `Makefile` — чистый `make x86` + `make x86-vk`
+- `calm_convert.c` — `--adaptive-quant` флаг
+ 
+### Производительность (расчёт)
+ 
+| Модель | Формат | Размер | Tok/s (scalar) | Tok/s (AVX2) |
+|--------|--------|--------|----------------|--------------|
+| Qwen2.5-7B | Q8_0 | 7.0 GB | 1-2 | 8-12 |
+| Qwen2.5-7B | BQ1_0 | 0.98 GB | 8-10 | 25-35 |
+| Qwythos-9B | TQ1_0 | 1.78 GB | 4-6 | 15-20 |
+| Bonsai-27B | BQ1_0 | 3.9 GB | 2-3 | 6-10 |
+ 
+*Расчёт для одного CPU core AVX2 (256-bit FMA, 8 FLOPS/cycle @ 3 GHz = 24 GFLOP/s теоретически)*
+ 
+### Зависимости
+- **Phase 6 (Requantizer)**: сжать модели в TQ1_0/BQ1_0
+- Phase 9 не зависит от Phase 7/8 — можно делать параллельно
+ 
+---
+ 
 ## 🐛 Исправленные баги (17 июля 2026)
 
 ### 1. TQ1_0 segfault при inference — `ct_matmul_tq1_0` buffer overflow
@@ -631,22 +767,23 @@ Transformer+SSM архитектур (Jamba, Ornith, Qwythos, Qwen3.5 SSM).
 
 **Фикс:** `calm_convert.c` — после каждого тензора добавляется padding до 32 байт.
 
-### 4. Bounds check в `stream_tensor()` — детекция обрезанных GGUF
-
-**Причина:** При конвертации обрезанного GGUF (tensor offset + size > mmap size) `stream_tensor()` читала данные за границей mmap → SIGBUS (crash) или мусорные данные без ошибки.
-
-**Симптомы на qwen2.5-0.5b:** Все 3 локальные GGUF файла (Q8_0=433MB, Q4_0=296MB, TQ1_0=323MB) оказались обрезанными — tensor_data_offset=5947744 совпадал, но файлы были на 14–56% меньше ожидаемого размера.
-
-**Фикс:** `calm_convert.c` — добавлена проверка `(const uint8_t*)src_row + src_stride > (const uint8_t*)src->data + src->size` перед каждым чтением строки, с понятным сообщением об ошибке (`tensor 'X' row Y exceeds mmap`).
-
-### 5. `--verify` — mmap output файла мог крешиться на /dev/null
-
-**Причина:** `verify_gguf()` вызывал `open()` + `mmap()` на выходной файл. Если выходной путь — `/dev/null` (нуль-тест), mmap возвращал MAP_FAILED.
-
-**Фикс:** `verify_gguf()` корректно обрабатывает MAP_FAILED и выводит сообщение об ошибке.
-
 ### 3. `is_head_tensor()` — ложное срабатывание на `attn_output.weight`
 
 **Причина:** Использовался `strstr(name, "output")`, который находил подстроку "output" в `blk.N.attn_output.weight` — все attention output проекции сохранялись в Q8_0 (8 бит) вместо конвертации в TQ1_0 (1.58 бит). Потеря ~19 MB на Qwen2.5-0.5B.
 
 **Фикс:** `calm_convert.c` — заменён на `strcmp()` по точным именам: только `token_embd.weight`, `tok_embd.weight`, `output.weight`, `head.weight`.
+
+### 4. Квантизованный matmul в `DEF_MATMUL_QUANT` — расходимость forward pass (31 июля 2026)
+
+**Причина:** Макрос `DEF_MATMUL_QUANT` (calm_infer.c) индексировал блоки весов смещением **входного** блока (`row = w + i0`), а не строки выхода. При row-major раскладке `[O строк × I колонок]` такое смещение идёт вдоль строк, а не колонок — деквант читал чужие строки весов, скалярные произведения были полностью неверны.
+
+**Симптом:** forward pass на `qwen2.5-0.5b.gguf`: L0 ffn_down range=[−1.86e8, 2.08e8], h `sum|abs|`=3.46e10 (idx 665), взрывной рост по слоям (77e9+), NaN при росте входной строки.
+
+**Фикс:** `calm_infer.c` — макрос переписан на итерацию выходных строк: `row = w + j*bpr + b`, где `bpr = ceil(I/BLOCK)` блоков на строку (та же конвенция, что у `ct_matmul_q8_0`, calm_quant.c:972). Конвенция вызовов не менялась: `matmul(y, x, w, type, I, O)`.
+
+**Верификация:**
+- L0 h `sum|abs|`: 3.46e10 → **146.21** (здоровый масштаб; эталон старого лога ≈245; старый референс на L20 = 15037, сейчас 4576 — лучше)
+- `calm_smoke` PASS на `qwen2.5-0.5b.gguf` (Q5_0/Q6_K) и `models/qwen2.5-0.5b-instruct-q4_0.gguf` (Q4_0): 24 слоя, 2 токена, без NaN/Inf
+- Независимый FP32-эталон строки 62 ffn_down (L21): `fp32ref == matmul` бит-в-бит (`diff=0.000000`) — деквант + matmul корректны
+- Обнаруженный при расследовании «спайк» нейрона 62 ffn_down (≈−695 на L21) — **реальные веса модели**: воспроизводится в двух независимых квантованиях (Q6_K и Q4_0), у строки 62 глобально-максимальный d=0.000153 (блок 1180) и второй по величине 0.000146 (блок 13); вход ffn_down на L21 содержит элемент |x|=1117 (silu(gate)*up). Не баг кода — особенность модели, остаточный рост h (146→7035) ниже старого эталона (245→15037).
+- Побочный результат аудита: удалены все временные отладочные принты из forward pass (calm_infer.c), сборка MSVC `/W4` — 0 предупреждений.

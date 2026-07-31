@@ -15,6 +15,15 @@
 #include <wctype.h>
 #include <limits.h>
 
+/* strndup is POSIX — not available on MSVC; provide a portable equivalent */
+static char* ct_strndup(const char* s, size_t n) {
+    size_t len = 0;
+    while (len < n && s[len]) len++;
+    char* r = (char*)malloc(len + 1);
+    if (r) { memcpy(r, s, len); r[len] = '\0'; }
+    return r;
+}
+
 /* ═══════════════════════════════════════════════════════════════
  * Helpers: UTF-8 decode
  * ═══════════════════════════════════════════════════════════════ */
@@ -36,8 +45,7 @@ static unsigned utf8_decode(const char* s, int* len) {
  * ═══════════════════════════════════════════════════════════════ */
 
 static int merge_cmp(const void* a, const void* b) {
-    int ia = *(const int*)a;
-    int ib = *(const int*)b;
+    (void)a; (void)b;
     /* We compare the actual merge entries via indices */
     return 0; /* placeholder — re-defined below */
 }
@@ -304,7 +312,6 @@ ct_tokenizer* ct_tokenizer_load(ct_gguf_context* gguf) {
 
     /* Read vocab size from GGUF */
     /* We scan metadata for tokenizer.ggml.tokens array */
-    int vocab_size = 0;
     for (int i = 0; i < gguf->metadata.count; i++) {
         if (strcmp(gguf->metadata.keys[i], "tokenizer.ggml.tokens") == 0 &&
             gguf->metadata.types[i] == CT_GGUF_VALUE_ARRAY) {
@@ -327,13 +334,10 @@ ct_tokenizer* ct_tokenizer_load(ct_gguf_context* gguf) {
 
     /* Scan metadata KV pairs to find tokenizer arrays */
     int found_tokens = 0;
-    int* token_types = NULL;
-    float* token_scores = NULL;
 
     /* We'll re-parse. Our ct_gguf_context has the raw data pointer. */
     const uint8_t* data = (const uint8_t*)gguf->data;
     size_t file_size = gguf->size;
-    size_t meta_pos = pos;
 
     /* Metadata is already parsed by ct_gguf_open into ctx->metadata.
      * For ARRAY values, we stored v_str = NULL but the raw data is still
@@ -345,7 +349,6 @@ ct_tokenizer* ct_tokenizer_load(ct_gguf_context* gguf) {
         if (pos >= file_size) break;
 
         /* Read key length + key */
-        size_t adv;
         uint64_t klen = 0;
         if (gguf->version == 1) {
             if (pos + 4 > file_size) break;
@@ -643,7 +646,11 @@ ct_tokenizer* ct_tokenizer_load(ct_gguf_context* gguf) {
             if (tok->tokens && tok->token_lens) {
                 for (int i = 0; i < gguf->vocab.n_vocab; i++) {
                     if (gguf->vocab.tokens[i]) {
+#if defined(_MSC_VER)
+                        tok->tokens[i] = _strdup(gguf->vocab.tokens[i]);
+#else
                         tok->tokens[i] = strdup(gguf->vocab.tokens[i]);
+#endif
                         tok->token_lens[i] = (int)strlen(gguf->vocab.tokens[i]);
                     }
                 }
@@ -701,20 +708,39 @@ ct_tokenizer* ct_tokenizer_load(ct_gguf_context* gguf) {
     }
 
     /* ── Discover special tokens from vocab ──
-     * Scan for tokens matching <|...|> and store for use during encode.
-     * These must be emitted as single tokens, not split by BPE. */
+     * Scan for tokens matching special delimiter patterns and store for
+     * use during encode. These must be emitted as single tokens, not
+     * split by BPE. Supports:
+     *
+     *   Llama-3 / Qwen style:  <|...|>     (standard vertical bar)
+     *   DeepSeek2 style:       <\uff5c...\uff5c> (fullwidth vertical bar ｜)
+     */
     tok->specials = NULL;
     tok->n_specials = 0;
     for (int v = 0; v < tok->vocab_size; v++) {
         if (tok->token_lens[v] <= 0) continue;
         const char* s = tok->tokens[v];
         int slen = tok->token_lens[v];
-        /* Match <|...|> pattern with len >= 5 (<||> min) */
-        if (slen >= 5 && s[0] == '<' && s[1] == '|' && s[slen-2] == '|' && s[slen-1] == '>') {
+        if (slen < 5 || s[0] != '<' || s[slen-1] != '>') continue;
+
+        /* Pattern 1: <|...|>  (standard bar, Llama-3 / Qwen) */
+        int is_special = 0;
+        if (s[1] == '|' && s[slen-2] == '|') {
+            is_special = 1;
+        }
+        /* Pattern 2: <\uff5c...\uff5c>  (fullwidth bar U+FF5C, DeepSeek2)
+         * UTF-8 encoding of U+FF5C: EF BD BC */
+        if (!is_special && slen >= 7 &&
+            (unsigned char)s[1] == 0xEF && (unsigned char)s[2] == 0xBD && (unsigned char)s[3] == 0xBC &&
+            (unsigned char)s[slen-4] == 0xEF && (unsigned char)s[slen-3] == 0xBD && (unsigned char)s[slen-2] == 0xBC) {
+            is_special = 1;
+        }
+
+        if (is_special) {
             void* p = realloc(tok->specials, sizeof(*tok->specials) * (size_t)(tok->n_specials + 1));
             if (!p) continue;
             tok->specials = p;
-            tok->specials[tok->n_specials].str = strndup(s, (size_t)slen);
+            tok->specials[tok->n_specials].str = ct_strndup(s, (size_t)slen);
             tok->specials[tok->n_specials].id  = v;
             tok->specials[tok->n_specials].len = slen;
             tok->n_specials++;

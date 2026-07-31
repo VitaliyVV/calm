@@ -9,6 +9,10 @@
  *   3. Host executes the function and returns: <|im_start|>tool\n<|tool_call|>\n{result}\n<|im_end|>\n<|im_start|>assistant\n
  *   4. Model generates final text response
  */
+#if defined(_MSC_VER)
+/* MSVC deprecates strncpy (C4996); the bounded copies below are intentional */
+#define _CRT_SECURE_NO_WARNINGS
+#endif
 #include "calm_tools.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -475,6 +479,7 @@ int ct_tools_parse(const char* output, CalmToolCall* calls, int max_calls) {
 
 /* Built-in tool implementations */
 static int exec_get_current_time(CalmToolCall* call, CalmToolResult* result) {
+    (void)call;
     /* arguments: {} — no params */
     time_t now = time(NULL);
     struct tm* tm = localtime(&now);
@@ -566,6 +571,7 @@ int ct_tools_execute(const CalmToolCall* call, CalmToolResult* result) {
 int ct_tools_format_result(const CalmToolCall* call,
                            const CalmToolResult* result,
                            char* buf, size_t buf_size) {
+    (void)call;
     if (!buf || buf_size == 0) return 0;
     return snprintf(buf, buf_size,
         "<|im_start|>tool\n<|tool_call|>\n%s\n<|im_end|>\n<|im_start|>assistant\n",
