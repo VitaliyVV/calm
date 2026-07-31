@@ -19,11 +19,15 @@
  *   Non-F32: K_nope = c[p] @ Wk_b_h per position (via matmul dispatch)
  *            V = c[p] @ Wv_b_h per position
  *
- * Wkv_b is stored column-major [dc, H*(dn+dv)]: column c starts at byte c * col_size.
+ * Wkv_b is a GGUF tensor [ne0=dc, ne1=H*(dn+dv)] with ne0 fastest:
+ *   F32:   element (k, c) at w_f32[c * dc + k]
+ *   Quant: blocks run along dc — block index = c*nb + k/BLOCK,
+ *          nb = ceil(dc/BLOCK), BLOCK = 256 (K-quants) or 32 (Q5_0/Q4_1/Q8_0/Q4_0/IQ4_NL).
  */
 
 #include "calm_mla.h"
 #include "calm_gguf.h"
+#include "calm_quant.h"
 #include <math.h>
 #include <string.h>
 #include <stdio.h>
@@ -51,7 +55,6 @@ static void mla_forward_f32(float* buf_q, const float* normed,
     const int q_rank = cfg->mla_q_lora_rank > 0 ? cfg->mla_q_lora_rank : dc;
     const int hd = dn + dr;
     const int total_per_head = dn + dv;
-    const int total_cols = H * total_per_head;
     float rcp_sqrt_hd = 1.0f / sqrtf((float)hd);
     int n_groups = H / HK;
     if (n_groups < 1) n_groups = 1;
@@ -120,15 +123,23 @@ static void mla_forward_f32(float* buf_q, const float* normed,
     for (int d = 0; d < dr; d++)
         k_cache[(size_t)(dc + d) * max_ctx + pos] = k_rope_cur[d];
 
-    /* Step 3: K_nope norm (per-head, applied to Wkv_b output) */
+    /* Step 3: K_nope norm (per head-group). Store each group's RMS of the K_nope
+     * expansion of the current latent into cache row (dc + dr + kg); scores for
+     * position p divide by that RMS (see Step 4b). Plain RMS — the attn_k_norm
+     * weight is intentionally not applied (same convention as attn_q_norm).
+     * Each group is expanded separately (TPH contiguous columns) so kv_b_cur
+     * never needs to hold the full H*total_per_head width. */
     if (lw->attn_k_norm) {
-        matmul(kv_b_cur, c, lw->attn_kv_b, lw->t_kvb, dc, total_cols);
-        for (int hh = 0; hh < HK; hh++) {
-            float* kh = kv_b_cur + hh * total_per_head;
+        for (int kg = 0; kg < HK; kg++) {
+            size_t off = ct_gguf_tensor_size(lw->t_kvb, 2,
+                            (uint64_t[]){ (uint64_t)dc, (uint64_t)((size_t)kg * total_per_head) });
+            const void* base = (const uint8_t*)lw->attn_kv_b + off;
+            matmul(kv_b_cur, c, base, lw->t_kvb, dc, total_per_head);
+            const float* kh = kv_b_cur;
             float sum_sq = 0.0f;
             for (int d = 0; d < dn; d++) sum_sq += kh[d] * kh[d];
-            float scale = 1.0f / sqrtf(sum_sq / (float)dn + 1e-6f);
-            for (int d = 0; d < dn; d++) kh[d] *= scale;
+            float rms = sqrtf(sum_sq / (float)dn + 1e-6f);
+            k_cache[(size_t)(dc + dr + kg) * max_ctx + pos] = rms;
         }
     }
 
@@ -167,6 +178,11 @@ static void mla_forward_f32(float* buf_q, const float* normed,
             const float* kr_p = k_cache + (size_t)dc * max_ctx + p;
             for (int d = 0; d < dr; d++)
                 dot_rope += Q_rope[d] * kr_p[(size_t)d * max_ctx];
+
+            if (lw->attn_k_norm) {
+                float rms_p = k_cache[(size_t)(dc + dr + kg) * max_ctx + p];
+                dot_nope = dot_nope / rms_p;
+            }
 
             scores[p] = (dot_nope + dot_rope) * rcp_sqrt_hd;
             if (scores[p] > max_score) max_score = scores[p];
@@ -216,6 +232,15 @@ extern void deq_q6_K(const void* b, float* out);
 extern void deq_q8_K(const void* b, float* out);
 extern void deq_iq4_nl(const void* b, float* out);
 
+/* 32-element legacy types: ct_dequant_* takes (block, out, count_elements);
+ * adapt to the (block, out[256]) signature used by the 256-element K-types. */
+static void deq_q8_0_wrap(const void* b, float* out) {
+    ct_dequant_q8_0((const ct_block_q8_0*)b, out, CT_QK8_0);
+}
+static void deq_q4_0_wrap(const void* b, float* out) {
+    ct_dequant_q4_0((const ct_block_q4_0*)b, out, CT_QK4_0);
+}
+
 /* ── General path: absorption-based with per-row dequant for quantized Wkv_b ── */
 static void mla_forward_general(float* buf_q, const float* normed,
                                 const ct_infer_layer* lw,
@@ -231,8 +256,6 @@ static void mla_forward_general(float* buf_q, const float* normed,
     const int q_rank = cfg->mla_q_lora_rank > 0 ? cfg->mla_q_lora_rank : dc;
     const int hd = dn + dr;
     const int total_per_head = dn + dv;
-    const int total_cols = H * total_per_head;
-    const int blocks_per_row = total_cols / CT_QK_K;
     float rcp_sqrt_hd = 1.0f / sqrtf((float)hd);
     int n_groups = H / HK;
     if (n_groups < 1) n_groups = 1;
@@ -241,21 +264,27 @@ static void mla_forward_general(float* buf_q, const float* normed,
     float kv_a_buf[1024];
     float kv_b_cur[4096]; /* scores up to max_ctx + K_norm output (max H*total_per_head=4096) */
 
-    /* Per-block byte stride in Wkv_b for quantized types */
-    int block_stride = (int)ct_gguf_tensor_size(lw->t_kvb, 1, (uint64_t[]){ (uint64_t)CT_QK_K });
-
-    /* Select dequant function pointer based on t_kvb */
+    /* GGUF block layout of Wkv_b: tensor [ne0=dc, ne1=total_cols], blocks along dc —
+     * block index = c*nb + kb (c = output column, kb = block along dc).
+     * BLOCK is type-dependent: 256 for K-quants, 32 for Q5_0/Q4_1/Q8_0/Q4_0/IQ4_NL. */
+    int block = CT_QK_K;
     void (*deq_fn)(const void*, float*) = NULL;
     switch (lw->t_kvb) {
         case CT_GGUF_TYPE_Q2_K: deq_fn = deq_q2_K; break;
         case CT_GGUF_TYPE_Q3_K: deq_fn = deq_q3_K; break;
         case CT_GGUF_TYPE_Q4_K: deq_fn = deq_q4_K; break;
-        case CT_GGUF_TYPE_Q5_0: deq_fn = deq_q5_0; break;
-        case CT_GGUF_TYPE_Q4_1: deq_fn = deq_q4_1; break;
         case CT_GGUF_TYPE_Q6_K: deq_fn = deq_q6_K; break;
         case CT_GGUF_TYPE_Q8_K: deq_fn = deq_q8_K; break;
+        case CT_GGUF_TYPE_Q5_0: deq_fn = deq_q5_0; block = CT_QK8_0; break;
+        case CT_GGUF_TYPE_Q4_1: deq_fn = deq_q4_1; block = CT_QK8_0; break;
+        case CT_GGUF_TYPE_Q8_0: deq_fn = deq_q8_0_wrap; block = CT_QK8_0; break;
+        case CT_GGUF_TYPE_Q4_0: deq_fn = deq_q4_0_wrap; block = CT_QK8_0; break;
+        case CT_GGUF_TYPE_IQ4_NL: deq_fn = deq_iq4_nl; block = CT_QK8_0; break;
         default: fprintf(stderr, "[MLA] unsupported Wkv_b type %d\n", lw->t_kvb); break;
     }
+    const int nb = (dc + block - 1) / block;        /* blocks per column along dc */
+    const size_t block_stride = ct_gguf_tensor_size(lw->t_kvb, 1, (uint64_t[]){ (uint64_t)block });
+    float buf[CT_QK_K];                             /* dequant scratch (max block) */
 
     /* Step 1: Q — fused or decomposed */
     int fused_q = (lw->attn_q != NULL);
@@ -295,9 +324,9 @@ static void mla_forward_general(float* buf_q, const float* normed,
         matmul(kv_a_buf, normed, lw->attn_kv_a, lw->t_kva, E, dc + dr);
     }
 
-    /* KV latent norm: weight tensor has dc elements (nope part only), not dc+dr */
+    /* KV latent norm over the full latent [dc+dr] (matches F32 path and llama.cpp) */
     if (lw->attn_kv_a_norm) {
-        rms_norm(kv_a_buf, kv_a_buf, lw->attn_kv_a_norm, dc, cfg->norm_rms_eps);
+        rms_norm(kv_a_buf, kv_a_buf, lw->attn_kv_a_norm, dc + dr, cfg->norm_rms_eps);
     }
 
     const float* c = kv_a_buf;
@@ -312,50 +341,54 @@ static void mla_forward_general(float* buf_q, const float* normed,
     for (int d = 0; d < dr; d++)
         k_cache[(size_t)(dc + d) * max_ctx + pos] = k_rope_cur[d];
 
-    /* Step 3: K_nope norm (per-head) */
+    /* Step 3: K_nope norm (per head-group). Store each group's RMS of the K_nope
+     * expansion of the current latent into cache row (dc + dr + kg); scores for
+     * position p divide by that RMS (see Step 4b). Plain RMS — the attn_k_norm
+     * weight is intentionally not applied (same convention as attn_q_norm).
+     * matmul is safe here: for a full row j it reads blocks (j*nb + kb) along dc,
+     * which is exactly the GGUF layout (linear index k + j*dc). Each group is
+     * expanded separately so kv_b_cur only needs total_per_head floats. */
     if (lw->attn_k_norm) {
-        /* This path uses the same absorption approach but for K_norm.
-         * For now, dispatch through matmul which is correct for full row access
-         * (not column-sliced). K_norm uses the entire Wkv_b [dc, H*total_per_head]
-         * but produces per-head K_nope which is then normed. */
-        matmul(kv_b_cur, c, lw->attn_kv_b, lw->t_kvb, dc, H * total_per_head);
-        for (int hh = 0; hh < HK; hh++) {
-            float* kh = kv_b_cur + hh * total_per_head;
+        for (int kg = 0; kg < HK; kg++) {
+            size_t off = ct_gguf_tensor_size(lw->t_kvb, 2,
+                            (uint64_t[]){ (uint64_t)dc, (uint64_t)((size_t)kg * total_per_head) });
+            const void* base = (const uint8_t*)lw->attn_kv_b + off;
+            matmul(kv_b_cur, c, base, lw->t_kvb, dc, total_per_head);
+            const float* kh = kv_b_cur;
             float sum_sq = 0.0f;
             for (int d = 0; d < dn; d++) sum_sq += kh[d] * kh[d];
-            float scale = 1.0f / sqrtf(sum_sq / (float)dn + 1e-6f);
-            for (int d = 0; d < dn; d++) kh[d] *= scale;
+            float rms = sqrtf(sum_sq / (float)dn + 1e-6f);
+            k_cache[(size_t)(dc + dr + kg) * max_ctx + pos] = rms;
         }
     }
 
-    /* Step 4: Per-head attention via absorption (dequantize Wkv_b per-row on the fly)
+    /* Step 4: Per-head attention via absorption (dequantize Wkv_b blocks on the fly)
      *
-     * Wkv_b is stored row-major as [dc, total_cols]. Each row k has blocks_per_row blocks.
-     * Head group kg uses columns [kg*total_per_head .. (kg+1)*total_per_head-1].
-     * Since total_per_head = 256 = CT_QK_K, this is exactly one block per row per head group.
-     *
-     * K portion of head group kg: block kg of each row, sub-indices 0..dn-1
-     * V portion of head group kg: block kg of each row, sub-indices dn..dn+dv-1
+     * Head group kg uses output columns [kg*total_per_head .. (kg+1)*total_per_head-1].
+     * Each column c is quantized along dc: block (c*nb + kb), sub-indices 0..block-1.
+     * K portion of a group: columns kg*total_per_head .. +dn-1
+     * V portion of a group: columns kg*total_per_head + dn .. +dn+dv-1
      */
     for (int hh = 0; hh < H; hh++) {
         int kg = hh / n_groups;
         float* Qh = buf_q + hh * hd;
         const float* Q_rope = Qh + dn;
 
-        /* Step 4a: Absorb Q_nope into K columns
-         * absorbed_q[k] = Σ_{d=0}^{dn-1} Qh[d] * Wkv_b[k][kg*256 + d]
-         * Each row k's element is at block k*blocks_per_row + kg, sub-index d */
+        /* Step 4a: Absorb Q_nope into K columns of group kg:
+         * absorbed_q[k] = Σ_d Qh[d] * Wkv_b[k][c=d]  (column c = kg*total_per_head + d) */
         float absorbed_q[512]; /* dc max */
         memset(absorbed_q, 0, (size_t)dc * sizeof(float));
         if (deq_fn) {
-            for (int k = 0; k < dc; k++) {
-                const void* bp = (const uint8_t*)lw->attn_kv_b + (size_t)(k * blocks_per_row + kg) * block_stride;
-                float buf[256];
-                deq_fn(bp, buf);
-                float sum = 0.0f;
-                for (int d = 0; d < dn; d++)
-                    sum += Qh[d] * buf[d];
-                absorbed_q[k] = sum;
+            for (int d = 0; d < dn; d++) {
+                const int col = kg * total_per_head + d;
+                const uint8_t* colp = (const uint8_t*)lw->attn_kv_b + (size_t)col * nb * block_stride;
+                float qd = Qh[d];
+                for (int kb = 0; kb < nb; kb++) {
+                    deq_fn(colp + (size_t)kb * block_stride, buf);
+                    int k0 = kb * block;
+                    for (int s = 0; s < block && k0 + s < dc; s++)
+                        absorbed_q[k0 + s] += qd * buf[s];
+                }
             }
         }
 
@@ -371,6 +404,11 @@ static void mla_forward_general(float* buf_q, const float* normed,
             const float* kr_p = k_cache + (size_t)dc * max_ctx + p;
             for (int d = 0; d < dr; d++)
                 dot_rope += Q_rope[d] * kr_p[(size_t)d * max_ctx];
+
+            if (lw->attn_k_norm) {
+                float rms_p = k_cache[(size_t)(dc + dr + kg) * max_ctx + p];
+                dot_nope = dot_nope / rms_p;
+            }
 
             scores[p] = (dot_nope + dot_rope) * rcp_sqrt_hd;
             if (scores[p] > max_score) max_score = scores[p];
@@ -397,17 +435,20 @@ static void mla_forward_general(float* buf_q, const float* normed,
         }
 
         /* Step 4e: V absorption
-         * out_h[d] = Σ_k weighted_c[k] * Wkv_b[k][kg*256 + dn + d] */
+         * out_h[d] = Σ_k weighted_c[k] * Wkv_b[k][c=dn+d]  (column c = kg*total_per_head + dn + d) */
         float* out_h = buf_q + hh * dv;
-        memset(out_h, 0, (size_t)dv * sizeof(float));
         if (deq_fn) {
-            for (int k = 0; k < dc; k++) {
-                const void* bp = (const uint8_t*)lw->attn_kv_b + (size_t)(k * blocks_per_row + kg) * block_stride;
-                float buf[256];
-                deq_fn(bp, buf);
-                float wk = weighted_c[k];
-                for (int d = 0; d < dv; d++)
-                    out_h[d] += wk * buf[dn + d];
+            for (int d = 0; d < dv; d++) {
+                const int col = kg * total_per_head + dn + d;
+                const uint8_t* colp = (const uint8_t*)lw->attn_kv_b + (size_t)col * nb * block_stride;
+                float acc = 0.0f;
+                for (int kb = 0; kb < nb; kb++) {
+                    deq_fn(colp + (size_t)kb * block_stride, buf);
+                    int k0 = kb * block;
+                    for (int s = 0; s < block && k0 + s < dc; s++)
+                        acc += weighted_c[k0 + s] * buf[s];
+                }
+                out_h[d] = acc;
             }
         }
     }

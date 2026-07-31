@@ -234,9 +234,11 @@ calm convert --input qwen3.6-27b-fp16 --output ternary-2bit --format tq1_0
 - [x] **Sensitive layer preservation** (Q8_0): token_embd.weight, output.weight — сохраняются в Q8_0
 - [x] **Dequant типов**: F32, F16, Q8_0, Q4_0, Q4_1, **Q5_0**, **Q5_1**, **Q2_K**, **Q4_K**, **Q5_K**, **Q6_K**
 - [ ] **Dequant типов (недостающие)**: Q3_K (stub), Q8_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_XS, IQ3_S, IQ4_NL, IQ4_XS
-- [ ] **PTQ calibration**: `--calibrate` флаг интеграция (MSE-optimal threshold для TQ1_0)
-- [ ] **Параллельная обработка**: requant нескольких тензоров одновременно (worker threads)
-- [ ] **Верификация**: флаг `--verify` — прочитать output GGUF, проверить целостность
+- [x] **PTQ calibration**: `--calibrate` флаг интеграция (MSE-optimal threshold для TQ1_0) — реализован (calm_convert.c, `calibrate_ternary`)
+- [x] **Параллельная обработка**: requant нескольких тензоров одновременно (worker threads, pthread, до 4 потоков)
+- [x] **Верификация**: флаг `--verify` — прочитать output GGUF, проверить целостность (`verify_gguf`)
+
+> ✅ **Проверено в рантайме 31 июля 2026:** `calm_convert --input qwen2.5-0.5b.gguf --format tq1_0 --calibrate --verify` — 290 тензоров, 4 потока, peak RAM = строка (~0 MB), output 231 MB → загружен движком (type=65 распознан), calm_smoke **PASS** (24 слоя, без NaN). Полная цепочка конвертер→движок работает.
 
 ### Технические детали
 - ✅ **Streaming loop реализован**: 2 прохода — Pass 1 вычисляет размеры, Pass 2 stream-конвертит
@@ -257,21 +259,23 @@ calm convert --input qwen3.6-27b-fp16 --output ternary-2bit --format tq1_0
 **Цель:** Добавить Mamba-style Selective Scan (SSM) для поддержки гибридных архитектур. Это откроет: Qwythos-9B (24 SSM + 8 attention слоёв), Qwen3.5-9B, Qwen3.6-27B (Bonsai), Ornith-9B.
 
 ### Компоненты
-- [ ] **SSM selective scan ядро** (Mamba-style, O(L) time):
+- [x] **SSM selective scan ядро** (Mamba-style, O(L) time):
   - Depthwise 1D convolution с SiLU активацией (conv1d)
   - Discretization: Δ → Ā, B̄
   - Scan loop: h[t] = Ā·h[t-1] + B̄·x[t] (все FP32)
   - Обработка 24 SSM слоёв за проход
 - [ ] **Fused QKV поддержка для SSM слоёв**:
-  - `attn_qkv.weight` → split на Q, K, V
-  - SSM-специфичные веса: `sm_conv1d`, `sm_alpha`, `sm_beta`, `sm_out`, `sm_a`, `sm_dt`
-- [ ] **Layer-type dispatch из GGUF metadata**:
+  - `attn_qkv.weight` → split на Q, K, V (НЕ реализовано — SSM реализован в конвенции llama.cpp `build_mamba_layer`: ssm_in/ssm_x/ssm_dt и т.д.)
+  - SSM-специфичные веса: `sm_conv1d`, `sm_alpha`, `sm_beta`, `sm_out`, `sm_a`, `sm_dt` — загружаются как ssm_conv1d/ssm_x/ssm_dt/ssm_a/ssm_d/ssm_out
+- [x] **Layer-type dispatch из GGUF metadata**:
   - Qwythos: слои 3,7,11,15,19,23,27,31 → attention; остальные 24 → SSM
-  - Определять по наличию `ssm_conv1d` vs `attn_q.weight` в GGUF
-  - Generic: читать из metadata ключ типа `qwen35.layer_type.{i}`
-- [ ] **QK-RoPE norms** для SSM attention слоёв
-- [ ] **Поддержка в `build_weights()`**: загрузка SSM тензоров по именам
-- [ ] **Поддержка в `ct_infer_forward()`**: per-layer выбор attention vs SSM
+  - Определять по наличию `ssm_conv1d` vs `attn_q.weight` в GGUF (`is_ssm` per layer)
+  - Generic: читать из metadata ключа типа `qwen35.layer_type.{i}`
+- [x] **QK-RoPE norms** для SSM attention слоёв (`ssm_dt_norm`, `ssm_b_norm`, `ssm_c_norm`, `attn_q_norm`, `attn_k_norm` — загрузка по именам)
+- [x] **Поддержка в `build_weights()`**: загрузка SSM тензоров по именам
+- [x] **Поддержка в `ct_infer_forward()`**: per-layer выбор attention vs SSM (`lw->is_ssm`)
+
+> ✅ Проверено по коду 31 июля 2026: calm_ssm.c — реальные `ct_ssm_conv1d`, `ct_ssm_selective_scan`, `ct_forward_ssm` (не заглушки); calm_infer.c — детекция `is_ssm` (стр. 787), загрузка весов (798-853), dispatch (1434). Открытым остаётся fused QKV (attn_qkv.split) для Qwythos-style SSM.
 
 ### Архитектура Qwythos-9B (32 слоя, Jamba-style)
 ```
@@ -317,6 +321,8 @@ MLA:                k_latent = x·Wuk (d×d_c),  k = k_latent·Wok (d_c×d_h)
 - [x] **Weight loading**: `attn_q_a`, `attn_q_b`, `attn_kv_a`, `attn_kv_b`, `attn_q_norm`, `attn_k_norm` — все MLA-специфичные тензоры
 - [x] **Shared experts**: фиксированные FFN (shared_gate/up/down) на всех токенах, загружаются через `build_weights()`
 - [x] **Integrate with Calm MoE**: shared expert добавлен поверх routed experts в MoE-секции forward pass
+- [x] **Quantized Wkv_b в MLA**: блочная деквант-адресация по GGUF layout (блоки вдоль dc; 256 для K-quants, 32 для Q5_0/Q4_1/Q8_0/Q4_0/IQ4_NL), `deq_q8_0_wrap`/`deq_q4_0_wrap` адаптеры
+- [x] **Synthetic MLA test** (`calm_mla_test.c`): F32 + Q8_0 пути против независимого референса, 3 комбо (k_norm/kv_a_norm), DC=64 → 2 блока Q8_0 на колонку — ALL PASS (F32 ~1e-5, Q8_0 в допуске 5%)
 - [ ] **DeepSeerMoE fine-grained routing**: 64 мелких эксперта, top-6 (на базе существующего MoE роутера)
 - [ ] **DeepSeek2 tokenizer**: BPE с специальными токенами (`<｜end▁of▁sentence｜>`, `惜`)
 - [ ] **Real DeepSeek2 GGUF model test**: тестирование на DS-Coder-V2-Lite (GGUF ~4 GB)
@@ -351,10 +357,12 @@ total params: ~15.7B
 - `calm_infer.h` — MLA config поля (kv_lora_rank, q_lora_rank, qk_nope_head_dim, qk_rope_head_dim, v_head_dim, n_shared_expert), MLA weights (attn_q_a/b, attn_kv_a/b, norm), MLA KV cache (mla_kv_cache)
 - `calm_infer.c` — MLA детекция через `attn_kv_a.weight`, weight loading, KV cache alloc, dispatch в forward pass
 - Shared expert (DeepSeekMoE) — weight loading + FFN forward поверх routed MoE
+- **Quantized Wkv_b в MLA absorption loops**: блочная адресация по GGUF layout (блоки вдоль dc), все типы Q2_K…Q8_K + Q5_0/Q4_1/Q8_0/Q4_0/IQ4_NL; `attn_kv_a_norm` нормирует dc+dr; Step 3 k_norm per-head-group с 2D-offset расширением (без переполнения `kv_b_cur[4096]`); деление `dot_nope` на RMS в обоих путях
+- **Исправлены переполнения**: `buf_q_size` в `calm_infer.c` теперь `H*(dn+dr)` при MLA (было 2048, DS-Coder-V2-Lite требует 3072); `mla_cache_dim` + `n_head_kv` строк на слой
+- **Synthetic MLA test** (`calm_mla_test.c`): независимый F32-референс, 3 комбо, F32/Q8_0 пути — ALL PASS (MSVC/AVX2)
 
 **Осталось:**
 - Тестирование на реальной DeepSeek2 GGUF модели (DS-Coder-V2-Lite-Instruct)
-- Поддержка quantized Wkv_b в MLA absorption loops (сейчас F32 fallback)
 - DeepSeek2 BPE tokenizer (специальные токены)
 - DeepSeerMoE fine-grained (64 experts, top-6) — существующий MoE роутер должен работать
 

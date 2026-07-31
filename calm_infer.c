@@ -1321,8 +1321,9 @@ ct_infer_state* ct_infer_create(ct_gguf_context* gguf, int max_ctx, int gpu_laye
 
     s->mla_kv_cache = NULL;
     if (cfg->mla_kv_lora_rank > 0) {
-        /* MLA (DeepSeek2) compressed KV cache replaces standard K/V cache */
-        int mla_dim = cfg->mla_kv_lora_rank + cfg->mla_qk_rope_head_dim;
+        /* MLA (DeepSeek2) compressed KV cache replaces standard K/V cache.
+         * + n_head_kv rows per layer: per-head-group RMS for attn_k_norm scores. */
+        int mla_dim = cfg->mla_kv_lora_rank + cfg->mla_qk_rope_head_dim + cfg->n_head_kv;
         size_t mla_elems = (size_t)cfg->n_layer * mla_dim * s->max_ctx;
         s->mla_kv_cache = (float*)calloc(mla_elems, sizeof(float));
         if (!s->mla_kv_cache) goto fail;
@@ -1350,8 +1351,14 @@ ct_infer_state* ct_infer_create(ct_gguf_context* gguf, int max_ctx, int gpu_laye
         int mla_qsize = cfg->n_head * cfg->mla_v_head_dim;
         if (mla_qsize > buf_q_size) buf_q_size = mla_qsize;
     }
-    /* Q matmul output is H * (dn+dr) for MLA, potentially > n_embd */
+    /* Q matmul output is H * head_dim for MHA; for MLA it is H * (dn+dr)
+     * (Q_nope + Q_rope), which exceeds H*head_dim on DeepSeek2 models
+     * (e.g. 16*192 = 3072 vs 16*128 = 2048 for DS-Coder-V2-Lite). */
     int q_out_size = cfg->n_head * cfg->head_dim;
+    if (cfg->mla_kv_lora_rank > 0) {
+        int mla_q_out = cfg->n_head * (cfg->mla_qk_nope_head_dim + cfg->mla_qk_rope_head_dim);
+        if (mla_q_out > q_out_size) q_out_size = mla_q_out;
+    }
     if (q_out_size > buf_q_size) buf_q_size = q_out_size;
     s->hidden  = (float*)calloc((size_t)cfg->n_embd, sizeof(float));
     s->normed  = (float*)calloc((size_t)cfg->n_embd, sizeof(float));
@@ -1463,7 +1470,7 @@ int ct_infer_forward(ct_infer_state* s, int pos,
 
             if (lw->is_mla) {
                 /* ── MLA (DeepSeek2) attention ── */
-                int mla_cache_dim = cfg->mla_kv_lora_rank + cfg->mla_qk_rope_head_dim;
+                int mla_cache_dim = cfg->mla_kv_lora_rank + cfg->mla_qk_rope_head_dim + cfg->n_head_kv;
                 float* mla_cache = s->mla_kv_cache
                     ? s->mla_kv_cache + (size_t)layer * mla_cache_dim * s->max_ctx
                     : NULL;
