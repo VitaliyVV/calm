@@ -325,7 +325,7 @@ MLA:                k_latent = x·Wuk (d×d_c),  k = k_latent·Wok (d_c×d_h)
 - [x] **Synthetic MLA test** (`calm_mla_test.c`): F32 + Q8_0 пути против независимого референса, 3 комбо (k_norm/kv_a_norm), DC=64 → 2 блока Q8_0 на колонку — ALL PASS (F32 ~1e-5, Q8_0 в допуске 5%)
 - [x] **DeepSeerMoE fine-grained routing**: 64 мелких эксперта, top-6 (на базе существующего MoE роутера) — подтверждено на реальной модели
 - [x] **Real DeepSeek2 GGUF model test**: DS-Coder-V2-Lite-Instruct Q2_K (6.0 GiB) — загрузка, 27 слоёв, MLA + MoE 64×top-6 + shared 2, генерация текста
-- [ ] **DeepSeek2 tokenizer**: BPE со специальными токенами (`<｜end▁of▁sentence｜>`, `惜`) — токенизатор работает (см. верификацию), спецтокены вне vocab требуют аккуратной обработки
+- [x] **DeepSeek2 tokenizer**: BPE со специальными токенами (`<｜end▁of▁sentence｜>`, `惜`) — обнаружение спецтокенов через fullwidth bar `｜` (U+FF5C, `calm_tokenizer.c:731-737`), emit как единый токен при encode; границы vocab защищены в `embed_row` (см. баг #12)
 
 ### Структура DeepSeek-Coder-V2-Lite (16B, MoE)
 ```
@@ -357,6 +357,8 @@ total params: ~15.7B
 - `calm_infer.h` — MLA config поля (kv_lora_rank, q_lora_rank, qk_nope_head_dim, qk_rope_head_dim, v_head_dim, n_shared_expert), MLA weights (attn_q_a/b, attn_kv_a/b, norm), MLA KV cache (mla_kv_cache)
 - `calm_infer.c` — MLA детекция через `attn_kv_a.weight`, weight loading, KV cache alloc, dispatch в forward pass
 - Shared expert (DeepSeekMoE) — weight loading + FFN forward поверх routed MoE
+- **embed_row bounds guard** (баг #12): `int embed_row(out, table, type, token, n_embd, n_vocab)` — OOB-токен (`< 0 || >= n_vocab`) → zero-fill + `-1`, все 7 вызовов обновлены (calm_infer prefill/генерация, calm_smoke, test_jamba); smoke Test 3 (OOB) PASS
+- **DeepSeek2 спецтокены BPE**: обнаружение fullwidth bar `｜` (U+FF5C) в vocab (`calm_tokenizer.c:731-737`), emit единым токеном при encode
 - **Quantized Wkv_b в MLA absorption loops**: блочная адресация по GGUF layout (блоки вдоль dc), все типы Q2_K…Q8_K + Q5_0/Q4_1/Q8_0/Q4_0/IQ4_NL; `attn_kv_a_norm` нормирует первые `dc` элементов (вес = kv_lora_rank = 512, см. баг #10); Step 3 k_norm per-head-group с 2D-offset расширением (без переполнения `kv_b_cur[4096]`); деление `dot_nope` на RMS в обоих путях
 - **Исправлены переполнения**: `buf_q_size` в `calm_infer.c` теперь `H*(dn+dr)` при MLA (было 2048, DS-Coder-V2-Lite требует 3072); `mla_cache_dim` + `n_head_kv` строк на слой
 - **Synthetic MLA test** (`calm_mla_test.c`): независимый F32-референс, 3 комбо, F32/Q8_0 пути — ALL PASS (MSVC/AVX2)
@@ -366,10 +368,11 @@ total params: ~15.7B
   - Слой 0 — плотный FFN (leading_dense_block_count=1), слои 1-26 — MoE
   - Forward всех 27 слоёв: **без NaN/Inf** (max_abs ~1e3)
   - Генерация: "The capital of France is" → "Paris. Paris is the capital city of France. It is a beautiful city…"
+  - Smoke Test 3 (OOB-токен vocab+7): `rc=-1 emb_sum=0.00` — границы vocab защищены (баг #12)
+  - Коммиты: `48cb791` (kv_a_norm + буферы + токены smoke, +408/−72), `014e156` (kv_a_norm dc-only по реальному GGUF, +55/−27), `453caf2` (embed_row bounds guard, +36/−11)
 
 **Осталось:**
-- DeepSeek2 BPE tokenizer: специальные токены вне vocab (Llama-совместимые ID 128000/128006 недопустимы при vocab=102400 — проверять границы)
-- Оптимизация скорости (MoE streaming, top-6, память)
+- Оптимизация скорости (MoE streaming, top-6, память) — единственный открытый хвост Phase 8
 
 ### Новые файлы (~250 строк)
 - `calm_mla.h` — декларация `ct_forward_mla()`
@@ -387,7 +390,7 @@ total params: ~15.7B
 Фаза 5: Production release       │ ░░░░░░░░░░░░░░░░  4-8 нед
 Фаза 6: GGUF↔GGUF Requantizer    │ ████████░░░░░░░░  1-2 нед    ◐ streaming done
 Фаза 7: SSM Forward Pass         │ ████████████████  2-3 нед    ✅
-Фаза 8: DeepSeek2 (MLA+MoE)      │ ██████░░░░░░░░░░  2-3 нед    ◐ MLA core validated
+Фаза 8: DeepSeek2 (MLA+MoE)      │ ████████████████  2-3 нед    ✅ MLA+MoE validated
 Фаза 9: x86/AVX2 Laptop Opt.     │ █████▓░░░░░░░░░░  1 нед      ◐ AVX2 kernels done
                                      └── ~5-10 месяцев всего
 ```
@@ -395,7 +398,7 @@ total params: ~15.7B
 **Ключевые вехи:**
 - Phase 6 → сжатие любых GGUF в TQ1_0/BQ1_0 через mmap streaming (prerequisite для всего)
 - Phase 7 → **Ornith-9B**, Qwythos-9B, Qwen3.5-9B на телефоне (SSM гибриды) ✅
-- Phase 8 → **DeepSeek-Coder-V2-Lite 16B** на телефоне (MLA + MoE, 2.3 GB BQ1_0) ◐ forward pass integrated
+- Phase 8 → **DeepSeek-Coder-V2-Lite 16B** на телефоне (MLA + MoE, 2.3 GB BQ1_0) ✅ forward pass + real model verified
 - Phase 9 → **x86 ноутбук**: AVX2-оптимизированные BQ1_0/TQ1_0 matmul ядра, runtime-детекция CPU features, Makefile x86 target, Windows CPUID, per-layer adaptive quant
 - Phase 7 + 8 → два top-tier кодер-движка на телефоне: Qwen3.5-based и DeepSeek-V2-based
 
@@ -415,7 +418,7 @@ total params: ~15.7B
 10. ✅ **GGUF→TQ1_0/BQ1_0 конвертер** — `calm_convert.c`
 11. ◐ **Phase 6: GGUF→GGUF Requantizer** — streaming core ✅, dequant F32/F16/Q8_0/Q4_0/Q4_1/Q5_0/Q5_1/Q2_K/Q4_K/Q5_K/Q6_K ✅, остались IQ форматы
 12. ✅ **Phase 7: SSM Forward Pass** — Mamba-style selective scan для Qwen3.5/Jamba/Ornith гибридов
-13. ✅ **Phase 8: DeepSeek2 (MLA+MoE)** — Multi-head Latent Attention + DeepSeekMoE (forward pass integrated; quantized Wkv_b блочная адресация + kv_a_norm dc-only фикс + переполнения буферов исправлены; synthetic MLA test ALL PASS; **реальная модель DS-Coder-V2-Lite Q2_K (6 GiB) загружается, 27 слоёв без NaN, генерация текста работает**; осталось: спецтокены BPE, оптимизация)
+13. ✅ **Phase 8: DeepSeek2 (MLA+MoE)** — Multi-head Latent Attention + DeepSeekMoE (forward pass integrated; quantized Wkv_b блочная адресация + kv_a_norm dc-only фикс + переполнения буферов исправлены; synthetic MLA test ALL PASS; **реальная модель DS-Coder-V2-Lite Q2_K (6 GiB) загружается, 27 слоёв без NaN, генерация текста работает**; спецтокены BPE (fullwidth bar) обрабатываются, границы vocab защищены в embed_row; осталось: оптимизация скорости)
 14. ◐ **Phase 9: x86/AVX2** — AVX2 matmul Q8_0/Q4_0/BQ1_0/TQ1_0 ✅, dequant/quant ✅, Makefile x86 ◐, CPUID Windows 🔲
 15. 📦 **mmap/expert streaming** — Colibri-style, холодные эксперты с диска
 16. 📦 **Qwen3.6 архитектура** — для запуска Bonsai-27B (1-bit, 3.9 GB) — зависит от Phase 7
@@ -803,7 +806,7 @@ DeepSeek-V3-671B     BQ1_0    94 GB  ❌ (не влезет)
 
 ---
 
-## 🐛 Исправленные баги Phase 8 — MLA (1 августа 2026)
+## 🐛 Исправленные баги Phase 8 — MLA + tokenizer + buffers (1 августа 2026)
 
 ### 5. Quantized Wkv_b — неверная блочная адресация (general path)
 
@@ -849,7 +852,22 @@ DeepSeek-V3-671B     BQ1_0    94 GB  ❌ (не влезет)
 
 **Причина:** `calm_smoke.c` хардкодил токены Llama (BOS=128000, спецтокен 128006), но у DS-Coder-V2-Lite vocab=102400. `embed_row` читала строки за концом `token_embd` (размер 68.8 MB, тензоры-соседи → значения 334944×3 одинаковых) — ложный FAIL.
 
-**Фикс:** `calm_smoke.c` — валидные токены 0 и 100. Проверка границ vocab в `embed_row` — рекомендация на будущее.
+**Фикс:** `calm_smoke.c` — валидные токены 0 и 100. Проверка границ vocab в `embed_row` — рекомендация на будущее → реализована (см. #12).
+
+### 12. embed_row — отсутствие bounds check по vocab (защита, 1 августа 2026)
+
+**Причина:** `embed_row()` не проверяла границы `token` — любой ID ≥ `vocab_size` (например, спецтокен Llama 128000 при vocab=102400 или мусорный токен из сэмплинга) читал строку за концом `token_embd`: OOB-чтение → гигантский мусор в эмбеддингах → ложные FAIL и потенциальные сбои. Строки за концом тензора попадали в соседние тензоры GGUF-файла.
+
+**Фикс:** `calm_infer.c` / `calm_infer.h` — сигнатура изменена на `int embed_row(out, table, type, token, n_embd, n_vocab)`:
+- `token < 0 || token >= n_vocab` → выход зануляется `memset`, возврат `-1` (успех = `0`)
+- Обновлены все 7 вызовов: `calm_infer.c` (prefill + генерация), `calm_smoke.c` (2), `test_jamba.c` (3)
+- `calm_smoke.c` — добавлен **Test 3 (OOB)**: токен `vocab+7` при отравленном буфере → ожидается `rc=-1, emb_sum=0`
+
+**Верификация:**
+- `calm_smoke.exe` (MSVC/AVX2) на реальной DS-Coder-V2-Lite Q2_K: Test 3 → `rc=-1 emb_sum=0.00` ✓, весь smoke **PASS**
+- `calm_mla_test.exe`: **ALL PASS** (F32 ~1e-5, Q8_0 в допуске 5%) — регрессии нет
+- WSL `make x86`: сборка чистая
+- Коммит `453caf2`: 4 файла, +36/−11
 
 **Верификация (1 августа 2026, MSVC/AVX2, `/W4` 0 предупреждений):**
 - `calm_mla_test.exe`: F32 vs референс max_abs 1.9e-5 / 1.3e-5 / 5.7e-6; Q8_0 vs референс 0.54 / 0.26 / 0.11 (допуск 5%) — **ALL PASS**, 3 комбо (k_norm/kv_a_norm), Q8_0 roundtrip max_err 8.1e-3
