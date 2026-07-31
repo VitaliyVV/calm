@@ -77,6 +77,20 @@ typedef struct {
     uint16_t d;        /* FP16 scale */
     uint8_t  qs[16];   /* packed signed 4-bit nibbles (2 per byte) */
 } ct_block_iq4_nl;
+
+/* Q2_K: 256 elements. 16 sub-blocks of 16. (GGUF type 10, llama.cpp layout)
+ * scales[sb]: lower 4 bits = scale idx, upper 4 bits = min idx.
+ * d = super-block scale, dmin = super-block min scale.
+ * value = q * d * sc_idx - dmin * min_idx.
+ * qs: 2-bit quants packed 4-per-byte (stride-32 interleave).
+ * 84 bytes total: scales[16] + qs[64] + d(F16) + dmin(F16). */
+#define CT_QK_K 256
+typedef struct {
+    uint8_t  scales[16]; /* 16 bytes: 4-bit scale + 4-bit min per sub-block */
+    uint8_t  qs[64];     /* 64 bytes: 2-bit quants, 4 per byte */
+    uint16_t d;          /* FP16 super-block scale */
+    uint16_t dmin;       /* FP16 super-block min */
+} ct_block_q2_K;
 #pragma pack(pop)
 
 /* ═══════════════════════════════════════════════════════════════
@@ -212,6 +226,10 @@ void ct_matmul_bq1_0(float* y, const float* x,
 /* TQ1_0 matmul: ternary {−1,0,+1} base-3 packing (NEON-optimized) */
 void ct_matmul_tq1_0(float* y, const float* x,
                       const ct_block_tq1_0* W, int I, int O);
+
+/* Q2_K matmul (AVX2-optimized; scalar fallback in calm_infer.c) */
+void ct_matmul_q2_K(float* y, const float* x,
+                     const ct_block_q2_K* W, int I, int O);
 
 /* ═══════════════════════════════════════════════════════════════
  * Optimized batch matmul: y[n][O] = x[n][I] @ W^T

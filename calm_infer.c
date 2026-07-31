@@ -62,9 +62,8 @@ static void vk_upload_weight(const void* w, int I, int O, const char* name) {
 
 /* ═══════════════════════════════════════════════════════════════
  * K-quant block structures (GGUF v3 spec)
+ * (ct_block_q2_K, CT_QK_K now live in calm_quant.h)
  * ═══════════════════════════════════════════════════════════════ */
-
-#define CT_QK_K 256
 
 #pragma pack(push, 1)
 typedef struct {
@@ -91,13 +90,8 @@ typedef struct {
  * scales[sb]: lower 4 bits = scale idx, upper 4 bits = min idx.
  * d = super-block scale, dmin = super-block min scale.
  * value = q * d * sc_idx - dmin * min_idx.
- * qs: 2-bit quants packed 4-per-byte (stride-32 interleave). */
-typedef struct {
-    uint8_t  scales[16]; /* 16 bytes: 4-bit scale + 4-bit min per sub-block */
-    uint8_t  qs[64];     /* 64 bytes: 2-bit quants, 4 per byte */
-    uint16_t d;          /* FP16 super-block scale */
-    uint16_t dmin;       /* FP16 super-block min */
-} ct_block_q2_K;
+ * qs: 2-bit quants packed 4-per-byte (stride-32 interleave).
+ * (typedef ct_block_q2_K moved to calm_quant.h) */
 
 /* Q3_K: 256 elements. 16 sub-blocks of 16.
  * hmask[32]: 1 high bit per element (packed 8 per byte).
@@ -342,7 +336,10 @@ static void matmul_##TYPE(float* y, const float* x, const CTYPE* w, int I, int O
 
 DEF_MATMUL_QUANT(q5_0, ct_block_q5_0, 32)
 DEF_MATMUL_QUANT(q4_1, ct_block_q4_1, 32)
+#ifndef __AVX2__
+/* Scalar fallback — AVX2 build uses ct_matmul_q2_K from calm_quant.c */
 DEF_MATMUL_QUANT(q2_K, ct_block_q2_K, CT_QK_K)
+#endif
 DEF_MATMUL_QUANT(q3_K, ct_block_q3_K, CT_QK_K)
 DEF_MATMUL_QUANT(q4_K, ct_block_q4_K, CT_QK_K)
 DEF_MATMUL_QUANT(q6_K, ct_block_q6_K, CT_QK_K)
@@ -412,7 +409,11 @@ void matmul(float* y, const float* x, const void* w, int type, int I, int O) {
             matmul_q5_0(y, x, (const ct_block_q5_0*)w, I, O);
             break;
         case CT_GGUF_TYPE_Q2_K:
+#ifdef __AVX2__
+            ct_matmul_q2_K(y, x, (const ct_block_q2_K*)w, I, O);
+#else
             matmul_q2_K(y, x, (const ct_block_q2_K*)w, I, O);
+#endif
             break;
         case CT_GGUF_TYPE_Q3_K:
             matmul_q3_K(y, x, (const ct_block_q3_K*)w, I, O);

@@ -32,8 +32,7 @@
 #include <string.h>
 #include <stdio.h>
 
-/* Quant block constants (from calm_infer.c) */
-#define CT_QK_K 256
+/* Quant block constants (CT_QK_K now in calm_quant.h) */
 
 /* ── Forward declarations from calm_infer.c ── */
 extern void matmul(float* y, const float* x, const void* w, int type, int I, int O);

@@ -372,7 +372,8 @@ total params: ~15.7B
   - Коммиты: `48cb791` (kv_a_norm + буферы + токены smoke, +408/−72), `014e156` (kv_a_norm dc-only по реальному GGUF, +55/−27), `453caf2` (embed_row bounds guard, +36/−11)
 
 **Осталось:**
-- Оптимизация скорости (MoE streaming, top-6, память) — единственный открытый хвост Phase 8
+- ~~Оптимизация скорости~~ → **Q2_K AVX2 matmul ядро реализовано** (`ct_matmul_q2_K`, calm_quant.c, см. Phase 9 §1): generation на DS-Coder-V2-Lite Q2_K ускорился **~1.74×** (58.68s → 33.67s на 10 токенов, ~4.2 → ~3.4 s/токен), вывод корректный ("Paris. Paris is the capital city of…")
+- Дальнейшая оптимизация (MoE streaming, top-6, память) — по-прежнему открытый хвост, но не блокирует Phase 8
 
 ### Новые файлы (~250 строк)
 - `calm_mla.h` — декларация `ct_forward_mla()`
@@ -686,6 +687,7 @@ DeepSeek-V3-671B     BQ1_0    94 GB  ❌ (не влезет)
 | `ct_matmul_q4_0` | Q4_0 (4-bit) | nibble unpack → sign-extend → FMA | ~3× над scalar |
 | `ct_matmul_bq1_0` | BQ1_0 (1-bit) | per-lane mask (`_mm256_and_ps`) + d·(2·Σ_masked−Σ_all) trick | ~5× над scalar |
 | `ct_matmul_tq1_0` | TQ1_0 (ternary) | dequant→Q8_0 buffer → AVX2 Q8_0 matmul | ~3× над scalar base-3 |
+| `ct_matmul_q2_K` | Q2_K (2-bit K-quant) | 16-bit lane shift + mask 0x0303 → per-sub-block 2-bit unpack, `_mm256_fmsub_ps` (q·dl−ml) + `_mm256_fmadd_ps` (x·w), scalar tail для I%256≠0 | ~1.74× end-to-end (58.68s→33.67s / 10 tok, DS-Coder-V2-Lite Q2_K); чистое matmul-ускорение выше, но MoE+MLA ограничивают |
  
 **`ct_matmul_bq1_0` (BQ1_0 AVX2):**
 - Обрабатывает 8 float/iteration
@@ -726,8 +728,9 @@ DeepSeek-V3-671B     BQ1_0    94 GB  ❌ (не влезет)
 #### 3. Runtime CPU feature detection ◐ (calm.c)
  
 - **Linux:** `/proc/cpuinfo` flags line — AVX2, AVX-512, BF16 уже парсятся ✅
-- **Windows:** CPUID via `__cpuid()` — `has_avx2`, `has_avx512`, `has_bf16` — **не реализован**
+- **Windows:** CPUID via `__cpuid()` — `has_avx2`, `has_avx512`, `has_bf16` — **реализован** (calm.c `#if defined(_WIN32)`, коммит Phase 7 `c5636b2`) ✅
 - CalmDevice уже содержит поля: `has_avx2`, `has_avx512`, `has_bf16` ✅
+- **Не хватает:** runtime-диспетчеризация matmul по `has_avx2` — сейчас диспетчер собран на compile-time `#ifdef __AVX2__` (calm_infer.c `matmul()`). Открытый хвост Phase 9.
  
 #### 4. Makefile x86 target ◐
  
@@ -743,10 +746,12 @@ DeepSeek-V3-671B     BQ1_0    94 GB  ❌ (не влезет)
 - Практическая разница: +0.5-1% accuracy, +2-5% размера
  
 ### Изменённые файлы (Phase 9)
-- `calm_quant.c` — AVX2 matmul ядра для Q8_0, Q4_0, BQ1_0, TQ1_0; dequant/quant/init функции; восстановлена AVX2-секция
+- `calm_quant.c` — AVX2 matmul ядра для Q8_0, Q4_0, BQ1_0, TQ1_0, **Q2_K** (`ct_matmul_q2_K`); dequant/quant/init функции; восстановлена AVX2-секция
+- `calm_quant.h` — `ct_block_q2_K` typedef + `CT_QK_K` перенесены в заголовок (единый источник для calm_infer/calm_mla/calm_quant), декларация `ct_matmul_q2_K`
 - `calm.h` — флаги CPU feature в CalmDevice ✅ (были добавлены ранее)
 - `calm.c` — `calm_device_probe()` CPUID на Windows + `/proc/cpuinfo` на Linux
-- `calm_infer.c` — dispatch matmul по `has_avx2` в рантайме
+- `calm_infer.c` — dispatch matmul по `has_avx2` в рантайме; Q2_K: compile-time `#ifdef __AVX2__` → `ct_matmul_q2_K` / `#else` → scalar `matmul_q2_K`
+- `calm_mla.c` — использует `CT_QK_K` из заголовка (удалён дубль `#define`)
 - `Makefile` — чистый `make x86` + `make x86-vk`
 - `calm_convert.c` — `--adaptive-quant` флаг
  
@@ -930,10 +935,11 @@ github.com/VitaliyVV/calm  (origin, единственный канал синх
 calm_mla_test.exe, calm_convert.exe). WSL — среда разработки/сборки, не таргет.
 Направление «работать без WSL» поддерживается нативно (Phase 9: Windows CPUID, MSVC).
 
-### Текущее состояние (после консолидации 1 августа 2026)
+### Текущее состояние (после Q2_K AVX2, 1 августа 2026)
 
-- WSL `~/calm` — HEAD `388c65e` (рабочий процесс + синхронизация) — источник истины, запушен в origin
-- Windows-клон синхронизирован **через git** (`fetch + reset --hard origin/main`, HEAD = `388c65e`):
+- WSL `~/calm` — HEAD Q2_K AVX2 (Phase 8 хвост + Phase 9 ядро) — источник истины, запушен в origin
+- **Q2_K AVX2 matmul** (`ct_matmul_q2_K`): DS-Coder-V2-Lite Q2_K generation **58.68s → 33.67s / 10 токенов (~1.74×)**, вывод корректный
+- Windows-клон синхронизирован **через git** (`fetch + reset --hard origin/main`):
   свежие исходники, бинарники, модели (DeepSeek-Coder-V2-Lite Q2_K 6 GB, dscoder-6.7b) + `tools/`
   (билд-скрипты, дамперы) — клон содержит только untracked-артефакты (*.exe, tools/, build_msvc.bat)
 - Вспомогательные скрипты: `tools/build_*.bat`, `tools/dump_gguf.c`, `tools/check_shexp.sh`,

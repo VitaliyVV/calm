@@ -1308,6 +1308,76 @@ void ct_matmul_tq1_0(float* y, const float* x,
     free(q8_buf);
 }
 
+/* ─── AVX2: Q2_K Matmul ───
+ * Q2_K: 256 elems/block = 16 sub-blocks of 16. Each sub-block has its own
+ * scale (dl = d*sc_low) and min (ml = dmin*sc_high): value = q*dl - ml.
+ * Byte layout (see deq_q2_K): element idx uses qs[g*32 + r] field c with
+ *   g = idx/128, r = idx%32, c = (idx%128)/32.
+ * Sub-block sb (16 elems): 16 consecutive bytes qs[g*32 + (sb&1)*16 + j],
+ *   all sharing one 2-bit field c = (sb%8)/2. Extract per byte with a
+ *   16-bit lane shift (shifts each byte's field into that byte's low 2 bits). */
+void ct_matmul_q2_K(float* y, const float* x,
+                     const ct_block_q2_K* W, int I, int O) {
+    int blk_per_I = (I + 255) / 256;
+
+    for (int j = 0; j < O; j++) {
+        const ct_block_q2_K* row = W + (int64_t)j * blk_per_I;
+        __m256 vacc = _mm256_setzero_ps();
+        float tail = 0.0f;
+
+        for (int b = 0; b < blk_per_I; b++) {
+            int i0 = b * 256;
+            int n = (I - i0 < 256) ? I - i0 : 256;  /* elems in this block */
+            int nsb = n / 16;                       /* full sub-blocks */
+            float d = fp16_to_f32(row[b].d);
+            float dmin = fp16_to_f32(row[b].dmin);
+            const uint8_t* qs = row[b].qs;
+            const uint8_t* sc = row[b].scales;
+
+            for (int sb = 0; sb < nsb; sb++) {
+                int g = sb >> 3;                 /* 0 or 1 */
+                int c = (sb >> 1) & 3;           /* (sb%8)/2 */
+                const uint8_t* qp = qs + g*32 + (sb & 1)*16;
+                float dl = d * (float)(sc[sb] & 0x0F);
+                float ml = dmin * (float)(sc[sb] >> 4);
+
+                /* 16 bytes → 2-bit field c of each byte → q in 0..3 */
+                __m128i v = _mm_loadu_si128((const __m128i*)qp);
+                __m128i qb = _mm_and_si128(_mm_srli_epi16(v, 2*c),
+                                           _mm_set1_epi8(3));
+                __m128i q16_lo = _mm_cvtepu8_epi16(qb);
+                __m128i q16_hi = _mm_cvtepu8_epi16(_mm_srli_si128(qb, 8));
+                __m256 qf_lo = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(q16_lo));
+                __m256 qf_hi = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(q16_hi));
+
+                /* weight = q*dl - ml */
+                __m256 dlv = _mm256_set1_ps(dl);
+                __m256 mlv = _mm256_set1_ps(ml);
+                qf_lo = _mm256_fmsub_ps(qf_lo, dlv, mlv);
+                qf_hi = _mm256_fmsub_ps(qf_hi, dlv, mlv);
+
+                int pos = i0 + sb*16;
+                __m256 xv_lo = _mm256_loadu_ps(x + pos);
+                __m256 xv_hi = _mm256_loadu_ps(x + pos + 8);
+                vacc = _mm256_fmadd_ps(xv_lo, qf_lo, vacc);
+                vacc = _mm256_fmadd_ps(xv_hi, qf_hi, vacc);
+            }
+
+            /* Scalar remainder: only the last block can be partial */
+            for (int k = nsb*16; k < n; k++) {
+                int g = k / 128, r = k % 32, c = (k % 128) / 32;
+                int sb = k / 16;
+                int q = (qs[g*32 + r] >> (c*2)) & 3;
+                float dl = d * (float)(sc[sb] & 0x0F);
+                float ml = dmin * (float)(sc[sb] >> 4);
+                tail += x[i0 + k] * ((float)q * dl - ml);
+            }
+        }
+
+        y[j] = hsum_ps(vacc) + tail;
+    }
+}
+
 /* ─── AVX2: F32 Matmul (8-wide FMA) ─── */
 void ct_matmul_f32(float* y, const float* x, const float* W, int I, int O) {
     for (int o = 0; o < O; o++) {
