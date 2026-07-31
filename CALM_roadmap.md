@@ -730,7 +730,7 @@ DeepSeek-V3-671B     BQ1_0    94 GB  ❌ (не влезет)
 - **Linux:** `/proc/cpuinfo` flags line — AVX2, AVX-512, BF16 уже парсятся ✅
 - **Windows:** CPUID via `__cpuid()` — `has_avx2`, `has_avx512`, `has_bf16` — **реализован** (calm.c `#if defined(_WIN32)`, коммит Phase 7 `c5636b2`) ✅
 - CalmDevice уже содержит поля: `has_avx2`, `has_avx512`, `has_bf16` ✅
-- **Не хватает:** runtime-диспетчеризация matmul по `has_avx2` — сейчас диспетчер собран на compile-time `#ifdef __AVX2__` (calm_infer.c `matmul()`). Открытый хвост Phase 9.
+- **Открытый хвост Phase 9 (задача на будущее) 🔲:** runtime-диспетчеризация matmul по `device->has_avx2`. Сейчас выбор ядра — compile-time `#ifdef __AVX2__` (calm_infer.c `matmul()`), хотя CPUID под Windows уже заполняет `has_avx2`. Смысл: один универсальный бинарник, который на машине без AVX2 автоматически падает на скалярные ядра вместо падения с SIGILL. Подход: в `matmul()` поставить `if (has_avx2) ct_matmul_q2_K(...) else matmul_q2_K(...)` — скалярные fallback уже существуют и компилируются всегда (guard `#ifndef __AVX2__` снять, но оставить вторым путём); AVX2-секцию calm_quant.c держать под `#ifdef __AVX2__`.
  
 #### 4. Makefile x86 target ◐
  
@@ -750,7 +750,7 @@ DeepSeek-V3-671B     BQ1_0    94 GB  ❌ (не влезет)
 - `calm_quant.h` — `ct_block_q2_K` typedef + `CT_QK_K` перенесены в заголовок (единый источник для calm_infer/calm_mla/calm_quant), декларация `ct_matmul_q2_K`
 - `calm.h` — флаги CPU feature в CalmDevice ✅ (были добавлены ранее)
 - `calm.c` — `calm_device_probe()` CPUID на Windows + `/proc/cpuinfo` на Linux
-- `calm_infer.c` — dispatch matmul по `has_avx2` в рантайме; Q2_K: compile-time `#ifdef __AVX2__` → `ct_matmul_q2_K` / `#else` → scalar `matmul_q2_K`
+- `calm_infer.c` — Q2_K: compile-time `#ifdef __AVX2__` → `ct_matmul_q2_K` / `#else` → scalar `matmul_q2_K` (runtime-диспетчеризация по `has_avx2` — открытый хвост, см. §3)
 - `calm_mla.c` — использует `CT_QK_K` из заголовка (удалён дубль `#define`)
 - `Makefile` — чистый `make x86` + `make x86-vk`
 - `calm_convert.c` — `--adaptive-quant` флаг
